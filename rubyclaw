@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+# RubyClaw entry point.
+#
+#   ./rubyclaw            chat with it (first run: sets itself up first)
+#   ./rubyclaw setup      re-run the configuration wizard
+#   ./rubyclaw up         Telegram bot + local prompt, in the foreground
+#   ./rubyclaw --help     everything else
+#
+# On a machine with no usable Ruby this installs one under $CLAW_HOME (default
+# ~/.rubyclaw) with no sudo, no package manager and no compiler: ruby-builder's
+# prebuilt tarball, relocated to that prefix. Then it hands over to bin/claw.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+
+case "${1:-}" in
+  -h | --help)
+    sed -n '2,10p' "$ROOT/rubyclaw" | sed 's/^# \{0,1\}//'
+    exit 0
+    ;;
+esac
+CLAW_HOME="${CLAW_HOME:-$HOME/.rubyclaw}"
+RUBY_DIR="$CLAW_HOME/ruby"
+MIN_MAJOR=3
+MIN_MINOR=1
+FALLBACK_VERSION="3.4.11"
+
+log() { printf 'rubyclaw: %s\n' "$*"; }
+die() { printf 'rubyclaw: %s\n' "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+ruby_ok() {                     # $1 = a ruby executable
+  [ -x "${1:-}" ] || return 1
+  local v maj min rest
+  v="$("$1" -e 'print RUBY_VERSION' 2>/dev/null)" || return 1
+  [ -n "$v" ] || return 1
+  maj="${v%%.*}"
+  rest="${v#*.}"
+  min="${rest%%.*}"
+  [ "$maj" -gt "$MIN_MAJOR" ] || { [ "$maj" -eq "$MIN_MAJOR" ] && [ "$min" -ge "$MIN_MINOR" ]; }
+}
+
+fetch() {                       # url [dest] — to stdout when no dest is given
+  if [ $# -gt 1 ]; then
+    if have curl; then curl -fsSL --retry 3 --max-time 900 -o "$2" "$1"
+    elif have wget; then wget -q --tries=3 -O "$2" "$1"
+    else die "need curl or wget to install Ruby"; fi
+  else
+    if have curl; then curl -fsSL --retry 3 --max-time 60 "$1"
+    elif have wget; then wget -q -O - "$1"
+    else die "need curl or wget"; fi
+  fi
+}
+
+# Returns 0 with a path, or 1 ("nothing here, go install one") / 2 ("you told me
+# where Ruby is and it is not usable"). The two must be distinguishable: this
+# function runs inside $( ), where exit only kills the subshell, so an explicit
+# CLAW_RUBY that is broken must not decay into a silent download.
+find_ruby() {
+  if [ -n "${CLAW_RUBY:-}" ]; then
+    if ruby_ok "$CLAW_RUBY"; then printf '%s' "$CLAW_RUBY"; return 0; fi
+    printf 'rubyclaw: CLAW_RUBY=%s is not usable (need Ruby %s.%s+)\n' \
+      "$CLAW_RUBY" "$MIN_MAJOR" "$MIN_MINOR" >&2
+    return 2
+  fi
+  local r why
+  r="$(command -v ruby 2>/dev/null || true)"
+  if [ -n "$r" ] && ruby_ok "$r"; then
+    # It runs, but can it load what the wizard needs? A distro Ruby without
+    # openssl fails later with a much more confusing message than this.
+    why="$(verify_ruby "$r")" || printf 'rubyclaw: %s cannot load net/http/openssl (%s)\n' "$r" "$why" >&2
+    printf '%s' "$r"; return 0
+  fi
+  if ruby_ok "$RUBY_DIR/bin/ruby"; then printf '%s' "$RUBY_DIR/bin/ruby"; return 0; fi
+  return 1
+}
+
+relocate() {                    # $1 = unpacked tree, $2 = the prefix it will live at
+  if have python3; then python3 "$ROOT/scripts/relocate_ruby.py" "$2" "$1"
+  elif have perl; then perl "$ROOT/scripts/relocate_ruby.pl" "$2" "$1"
+  else return 2
+  fi
+}
+
+verify_ruby() {                 # $1 = a ruby executable
+  "$1" -e 'require "json"; require "net/http"; require "openssl"; require "yaml"; require "io/console"; require "digest"; print "ok"' 2>&1
+}
+
+# There is no prebuilt Ruby for this machine. Say why, and give the shortest way to
+# get one: a confusing failure at install time is what this script exists to avoid.
+# (This was "unsupported architecture: armv6l" -- a dead end with no way forward.)
+no_prebuilt() {                 # $1 = uname -m
+  local found="" version=""
+  found="$(command -v ruby 2>/dev/null || true)"
+  [ -n "$found" ] && version="$("$found" -e 'print RUBY_VERSION' 2>/dev/null || true)"
+  {
+    printf 'rubyclaw: no prebuilt Ruby for %s.\n' "$1"
+    printf '  The upstream tarball (ruby-builder) ships Linux builds for x86-64 and arm64 only;\n'
+    printf '  there is no 32-bit ARM, ppc64le, s390x or riscv64 build to download.\n'
+    printf '  The harness is stdlib-only, so any Ruby %s.%s+ runs it -- it just has to exist.\n' "$MIN_MAJOR" "$MIN_MINOR"
+    [ -n "$version" ] && printf '  %s is Ruby %s, which is too old.\n' "$found" "$version"
+    printf '  Get one with:  apt install ruby-full   (Raspberry Pi OS/Debian 12+, Ubuntu 24.04+)\n'
+    printf '                 rbenv install 3.4.11    (any Linux, compiles it)\n'
+    printf '                 brew install ruby       (macOS)\n'
+    printf '  On a 32-bit-only board (Pi Zero/1) that means Bookworm or newer: Bullseye\n'
+    printf '  ships Ruby 2.7, which is below the floor.\n'
+    printf '  Then run ./rubyclaw again -- it finds Ruby on PATH -- or point at it:\n'
+    printf '    CLAW_RUBY=/usr/bin/ruby3.1 ./rubyclaw\n'
+  } >&2
+  exit 1
+}
+
+install_ruby() {
+  [ "$(uname -s)" = "Linux" ] || die "no prebuilt Ruby for $(uname -s) here — install Ruby $MIN_MAJOR.$MIN_MINOR+ (e.g. brew install ruby) and run again, or point CLAW_RUBY at it"
+  if have ldd && ldd /bin/sh 2>/dev/null | grep -qi musl; then
+    die "this system uses musl libc (Alpine?) and the prebuilt Ruby needs glibc — install ruby with apk, or set CLAW_RUBY"
+  fi
+
+  local arch a
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64 | amd64) a=x64 ;;
+    aarch64 | arm64) a=arm64 ;;
+    *) no_prebuilt "$arch" ;;
+  esac
+
+  local glibc variants
+  glibc="$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}')"
+  [ -n "$glibc" ] || glibc="$(ldd --version 2>/dev/null | head -1 | awk '{print $NF}')"
+  [ -n "$glibc" ] || die "cannot determine the glibc version (getconf GNU_LIBC_VERSION failed)"
+  case "${CLAW_RUBY_VARIANT:-}" in
+    "") case "$glibc" in
+          2.3[9] | 2.4[0-9] | 2.[5-9]* | 3.*) variants="24.04 22.04" ;;
+          2.3[5-8]) variants="22.04" ;;
+          *) die "glibc $glibc is older than 2.35 (Ubuntu 22.04), so the prebuilt Ruby will not load — install Ruby $MIN_MAJOR.$MIN_MINOR+ with your package manager, or set CLAW_RUBY" ;;
+        esac ;;
+    *) variants="$CLAW_RUBY_VARIANT" ;;
+  esac
+
+  local version
+  version="${CLAW_RUBY_VERSION:-}"
+  if [ -z "$version" ]; then
+    version="$(fetch "https://api.github.com/repos/ruby/ruby-builder/releases/latest" 2>/dev/null |
+      sed -n 's/.*"tag_name": *"ruby-\([0-9][^"]*\)".*/\1/p' | head -1)" || version=""
+  fi
+  [ -n "$version" ] || { version="$FALLBACK_VERSION"; log "GitHub API unreachable, using Ruby $version"; }
+
+  for v in $variants; do
+    local url tgz
+    tgz="$CLAW_HOME/dl/ruby-$version-ubuntu-$v-$a.tar.gz"
+    url="https://github.com/ruby/ruby-builder/releases/download/ruby-$version/ruby-$version-ubuntu-$v-$a.tar.gz"
+    mkdir -p "$CLAW_HOME/dl" "$CLAW_HOME/tmp"
+    if [ ! -s "$tgz" ]; then
+      log "downloading Ruby $version ($arch, glibc $glibc) — ~40 MB, once"
+      fetch "$url" "$tgz" || { log "download failed: $url"; continue; }
+    fi
+    rm -rf "$CLAW_HOME/tmp/$a"
+    tar xzf "$tgz" -C "$CLAW_HOME/tmp" || { log "unpack failed for $tgz"; continue; }
+    [ -d "$CLAW_HOME/tmp/$a" ] || { log "unexpected tarball layout (no $a/ at the top)"; continue; }
+
+    # Rewrite the baked-in CI prefix to the FINAL install path before the move --
+    # patching a staging path and then moving the tree leaves every baked path
+    # pointing at a directory that no longer exists, and Ruby will not start.
+    log "relocating it to $RUBY_DIR"
+    relocate "$CLAW_HOME/tmp/$a" "$RUBY_DIR" ||
+      die "could not relocate the Ruby install (needs python3 or perl, and an install path no longer than 40 characters)"
+
+    rm -rf "$RUBY_DIR.old"
+    [ -d "$RUBY_DIR" ] && mv "$RUBY_DIR" "$RUBY_DIR.old"
+    mv "$CLAW_HOME/tmp/$a" "$RUBY_DIR"
+
+    local probe
+    if probe="$(verify_ruby "$RUBY_DIR/bin/ruby")" && [ "$probe" = "ok" ]; then
+      rm -rf "$RUBY_DIR.old" "$CLAW_HOME/tmp" "$tgz"
+      log "Ruby $version ready at $RUBY_DIR"
+      return 0
+    fi
+    log "that build did not load on this system ($probe)"
+    rm -rf "$RUBY_DIR"
+    [ -d "$RUBY_DIR.old" ] && mv "$RUBY_DIR.old" "$RUBY_DIR"
+  done
+  die "could not install a working Ruby. Install Ruby $MIN_MAJOR.$MIN_MINOR+ with your package manager and run again, or point CLAW_RUBY at an existing ruby."
+}
+
+# ---- git: the harness commits its own growth, so its tree must be a repository
+if [ ! -d "$ROOT/.git" ] && have git; then
+  git -C "$ROOT" init -q
+  git -C "$ROOT" add -A >/dev/null 2>&1 || true
+  git -C "$ROOT" -c user.email=claw@localhost -c user.name=RubyClaw commit -q -m "RubyClaw: initial import" >/dev/null 2>&1 || true
+fi
+
+# ---- hand over
+found=0
+RUBY="$(find_ruby)" || found=$?
+case "$found" in
+  0) exec "$RUBY" "$ROOT/bin/claw" "$@" ;;
+  2) die "refusing to install a different Ruby while CLAW_RUBY is set — fix that path or unset it" ;;
+esac
+
+install_ruby
+RUBY="$RUBY_DIR/bin/ruby"
+ruby_ok "$RUBY" || die "the installed Ruby is not usable — try again, or set CLAW_RUBY"
+# Load the stdlib the harness needs before declaring success: a tarball for the wrong
+# libc or the wrong CPU dies here with the loader's own error, rather than at the first
+# HTTPS call with a message that points nowhere.
+if ! why="$(verify_ruby "$RUBY")"; then
+  die "the Ruby just installed cannot load its own stdlib: $why"
+fi
+exec "$RUBY" "$ROOT/bin/claw" "$@"

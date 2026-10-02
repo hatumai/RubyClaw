@@ -1,0 +1,127 @@
+# policy.yml -- what RubyClaw may do without a person.
+#
+# The flow is ACTION -> POLICY -> one of these four:
+#
+#   auto        run it now, no human involved
+#   ask         do NOT run it. Park an approval in the work store (data/approvals.json)
+#               and tell the model it is waiting on a person. A person's grant lets
+#               the same action run once -- the grant is consumed by the call that
+#               uses it, so a second identical call must ask again.
+#   block       never run it, and no approval can grant it
+#   human_only  the agent is never the actor; a person does it outside the harness.
+#               No approval can grant it either.
+#
+# DEFAULT-DENY, and it is the point of the file: an action that matches no rule below
+# is `ask`, never `auto`. A missing or unreadable file fails the same way. That is what
+# makes leaving the harness unattended defensible -- a rule you did not write cannot
+# hand the agent autonomy.
+#
+# Matching is by action NAME only, first matching rule wins, and `*` is a glob:
+# `files.*` matches `files.read` and `files.delete`. The policy deliberately does not
+# inspect arguments -- it cannot tell a read from a write inside one name, and it cannot
+# see what a command or an HTTP body contains. Where the line matters the harness names
+# two actions instead (http.get vs http.send). See REVIEW.md for what that leaves open.
+#
+# Action names are namespaced and come from one explicit table in lib/policy.rb (tool
+# name -> action name), not from prose:
+#   shell.run   files.read   files.write   files.search   http.get   http.send
+#   notes.write  browser.drive  schedule.manage  work.manage  work.decide
+#   responsibility.manage  selfwrite.tool  selfwrite.skill  selfwrite.core
+#   scout.search  scout.read   (reads only; there is no writable scout.* action)
+#   telegram.send  (the harness's own outbound bot; `auto`, see the rule below)
+#   tool.<name>  for any self-written or unlisted tool (unmatched -> ask)
+#
+# Every decision is appended to data/events.jsonl (kind policy.auto / policy.ask /
+# policy.block / policy.human_only / policy.granted, plus approval.consumed), so what
+# ran unattended and what a person authorised is reconstructable afterwards.
+#
+# Edit this file and the next tool call sees it; no restart. Point the layer at a
+# different file with CLAW_POLICY=/path/to/another.yml.
+
+default: ask
+
+rules:
+  # --- reading changes nothing: let the model see --------------------------------
+  - match: files.read
+    policy: auto
+    note: reading a file changes nothing
+  - match: files.search
+    policy: auto
+    note: searching changes nothing
+  - match: http.get
+    policy: auto
+    note: a GET/HEAD is a read; http.send covers everything else
+  # Scout's two actions are reads with no writable twin (lib/scout.rb issues GET and
+  # nothing else, by construction). Both are auto; a POST from Scout is not listed as
+  # "ask" because it does not exist -- there is no scout.send action name.
+  - match: scout.search
+    policy: auto
+    note: a keyless web search; it reads and changes nothing
+  - match: scout.read
+    policy: auto
+    note: one GET of one URL, returned as untrusted text; robots.txt is respected
+  # --- the harness's own bookkeeping --------------------------------------------
+  - match: notes.write
+    policy: auto
+    note: a durable note to itself, injected into future prompts
+  - match: work.manage
+    policy: auto
+    note: its own task/artifact/event store
+
+  # --- the approval channel itself must stay open -------------------------------
+  # The Telegram bot is how an approval reaches a person, so its own sends must never be
+  # parked. An approval system whose own notification channel waits for an approval would
+  # deadlock: the message carrying the Approve button would be the thing held, and nobody
+  # could ever grant the action it is about. This is `auto` by an explicit rule rather
+  # than by an accident of the default, so the autonomy is stated and cannot be revoked
+  # by a stray edit above it.
+  - match: telegram.send
+    policy: auto
+    note: the approval channel itself must stay open, or approving anything would deadlock
+
+  # --- the agent must never decide its own approvals ----------------------------
+  # `work` with action=decide is separate from the rest of the work store, because a
+  # self-granted approval would make this whole file a formality. A person decides
+  # with `claw work decide <approval_id> granted|denied`.
+  - match: work.decide
+    policy: human_only
+    note: only a person may resolve an approval
+
+  # --- asking, for the things the analysis names ---------------------------------
+  # (`ask` is also the default, so these rules document intent as much as they decide
+  # it. They are listed so a person editing this file finds them by name.)
+  - match: files.write
+    policy: ask
+    note: writing can overwrite work someone else needs
+  - match: files.delete
+    policy: ask
+    note: deletion is not undoable here
+  - match: shell.run
+    policy: ask
+    note: the shell can do anything, including all of the below. It also holds a
+      scheduled job's shell command, which the scheduler runs itself
+  - match: http.send
+    policy: ask
+    note: POST/PUT/DELETE -- sending mail, posting, paying
+  - match: purchase
+    policy: ask
+    note: spending money
+  - match: browser.drive
+    policy: ask
+    note: clicks and form submits reach the world
+  - match: schedule.manage
+    policy: ask
+    note: a schedule runs later, possibly unattended
+  - match: responsibility.manage
+    policy: ask
+    note: a standing commitment starts work on its own, possibly unattended
+  - match: selfwrite.*
+    policy: ask
+    note: growing yourself changes the program you run inside
+
+  # --- never, and no approval can grant it ---------------------------------------
+  # No tool produces a credentials.* action yet; the rule is here so the intent lives
+  # in the file and not only in a review.
+  - match: credentials.*
+    policy: human_only
+    note: credentials are a person's to hold and use

@@ -1,0 +1,12 @@
+# Used by the test suite, not by the harness at runtime.
+#
+# The suite's in-process and sandboxed tests exercise tool *mechanics* -- argument
+# passing, error containment, truncation, path confinement -- and must not also be a
+# test of the autonomy policy, or every one of them would have to carry an approval.
+# So the suite pins this file (test_helper sets CLAW_POLICY at it) and every tool runs.
+#
+# The policy's own enforcement is tested in test/policy_test.rb, which points CLAW_POLICY
+# at the shipped policy.yml (or a fixture) and asserts the real thing: default-deny, a
+# held action that does not run, a grant consumed by one call, and the event log.
+default: auto
+rules: []

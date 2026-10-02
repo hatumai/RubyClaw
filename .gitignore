@@ -1,0 +1,19 @@
+.staging/
+log/
+.env
+*.prev
+
+# Runtime state: durable on disk, deliberately not source. The browser profile is
+# hundreds of megabytes of cache, screenshots are byproducts, and schedule.json is
+# rewritten every time a job runs -- committing it would be a commit per minute.
+# Nothing here is needed to run a fresh copy: it all regenerates.
+data/
+
+# Instance state, not source. These live in the program's own root because a
+# stdlib-only harness has no other place to put them, and each one is created on
+# demand: `claw setup` writes config.yml and Notes.ensure! creates the two notes
+# files, so a fresh clone needs none of them. Committing them shipped one
+# machine's endpoint, and one instance's own accumulated notes, to everyone.
+memory.md
+preferences.md
+config.yml

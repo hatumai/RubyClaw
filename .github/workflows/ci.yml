@@ -1,0 +1,26 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby: ["3.3", "3.4"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+      - name: install rubocop
+        run: gem install rubocop --no-document -v 1.91.0
+      - name: selftest
+        run: ./rubyclaw selftest
+      - name: suite
+        run: ruby -Ilib -Itest test/all.rb
+      - name: lint
+        run: rake lint

@@ -1,0 +1,50 @@
+[
+ {
+  "update_id": 1,
+  "message": {
+   "chat": {
+    "id": 999
+   },
+   "from": {
+    "username": "stranger"
+   },
+   "text": "hi, what are you?"
+  }
+ },
+ {
+  "update_id": 2,
+  "message": {
+   "chat": {
+    "id": 12345
+   },
+   "from": {
+    "username": "the operator"
+   },
+   "text": "Use your sh tool to run 'date -u +%H:%M:%SZ' and reply with just the output."
+  }
+ },
+ {
+  "update_id": 3,
+  "message": {
+   "chat": {
+    "id": 12345
+   },
+   "from": {
+    "username": "the operator"
+   },
+   "text": "/model"
+  }
+ },
+ {
+  "update_id": 4,
+  "message": {
+   "chat": {
+    "id": 12345
+   },
+   "from": {
+    "username": "the operator"
+   },
+   "text": "/tools"
+  }
+ }
+]

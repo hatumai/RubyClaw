@@ -1,0 +1,25 @@
+# RubyClaw configuration — an example. The real config.yml is written by `claw setup`.
+#
+# Resolution order for each value: CLI flag > environment > this file > default.
+# Secrets do NOT belong in this file, nor in the real config.yml (which is
+# instance state and gitignored). They live in .env,
+# which is gitignored and chmod 600 — see .env.example.
+#
+# Any OpenAI-compatible endpoint works; nothing here is provider-specific.
+
+model: deepseek-chat
+base_url: https://api.deepseek.com/v1
+
+# Uncomment to force a key to be read from this file instead of .env. Only useful
+# for a throwaway box; .env exists so this file never has to hold a secret.
+# api_key: sk-...
+
+# Telegram (see README > Talking to it from Telegram). The bot token goes in .env
+# as CLAW_TELEGRAM_TOKEN; this is the allowlist of chats that may use it.
+# Default-deny: an empty list means every chat is refused, and the refusal echoes
+# the chat id so you can learn your own without guessing.
+telegram_allowed_chat_ids: []
+
+# Set by `claw setup` so a later run does not ask again. Delete it (or run
+# `claw setup`) to be walked through the wizard again.
+setup_complete: true

@@ -1,0 +1,579 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+# claw — RubyClaw's entry point.
+#
+# Boot guard: if the harness will not even load (usually a self-written core
+# patch), count the failure and, on the second consecutive one, revert the last
+# core commit. That is what makes letting a language model edit lib/ survivable.
+# Line-buffered output: a service redirects stdout to a file or to journald, which is not a
+# terminal, so Ruby block-buffers it and the log stays empty until 4 KB accumulates -- a machine
+# that looks dead but is working. Cost of the fix: nothing.
+$stdout.sync = true
+
+ROOT = File.expand_path("..", __dir__)
+COUNT = File.join(ROOT, ".staging", "boot_failures")
+CORE_MARK = File.join(ROOT, ".staging", "core_commit")
+require "fileutils"
+require "json"
+
+# Service mode owns the tree, and the claim *and* the stop handlers have to be in place
+# before the slow work -- the requires below are 7-8 s on the armv6 test bed (measured: 6.8 s
+# from exec to the old claim, 15.9 s for a keeper whose only job was to print "already
+# running"). Inside that window the old code had no pidfile and no signal handlers, so:
+#
+#   * a second keeper (cron has no idea the first exists) booted its own poller and two bots
+#     then stole each other's messages; and
+#   * a TERM arriving during the boot/connect window killed the process by signal -- exitstatus
+#     nil, which a supervisor reads as a crash -- instead of stopping it cleanly.
+#
+# So claim first and trap first. `serve` re-arms its own handlers (which park the bot and let
+# it stop gracefully) as soon as it runs, and Claim.claim! is idempotent, so the claim taken
+# here is the same one serve would otherwise have taken.
+SERVICE = %w[up serve].include?(ARGV[0]) &&
+          (ARGV.include?("--telegram-only") || ARGV.include?("--no-prompt"))
+if SERVICE
+  %w[INT TERM].each { |sig| Signal.trap(sig) { exit 0 } }
+  require_relative "../lib/claim"
+  if ARGV.include?("--if-not-running") && RubyClaw::Claim.held_by_other?
+    puts RubyClaw::Claim.running_note
+    exit 0
+  end
+  unless RubyClaw::Claim.claim!
+    puts RubyClaw::Claim.running_note
+    exit 0
+  end
+end
+
+def boot_failures = File.exist?(COUNT) ? File.read(COUNT).to_i : 0
+
+# Which commit to undo: the one recorded when the core patch was accepted, not
+# whatever happens to be HEAD. Recovering it from the commit subject meant that as
+# soon as any later commit landed (a promoted tool, say) the revert had no target and
+# the failure counter just climbed: (1/2), (2/2), (3/2) …
+def core_commit
+  return nil unless File.exist?(CORE_MARK)
+
+  sha = File.read(CORE_MARK).strip
+  sha.match?(/\A[0-9a-f]{7,40}\z/) ? sha : nil
+end
+
+def revert_core_commit
+  sha = core_commit
+  subject = `git -C #{ROOT} log -1 --format=%s #{sha} 2>/dev/null`.strip
+  unless sha
+    return "claw: core failed to boot twice and no core patch is on record to revert.\n" \
+           "      Last commit: #{subject.inspect}\n" \
+           "      Undo it by hand:  git -C #{ROOT} revert HEAD   (or git -C #{ROOT} checkout -- lib/)"
+  end
+
+  out = `git -C #{ROOT} revert --no-edit #{sha} 2>&1`
+  if $?.success? && !out.include?("error:") && !out.include?("fatal:")
+    FileUtils.rm_f(CORE_MARK)
+    File.write(COUNT, "0")
+    "claw: core failed to boot twice — reverted #{subject.inspect} (#{sha[0, 8]}). Try again."
+  else
+    # Announce nothing that did not happen: a dirty working tree makes `git revert`
+    # fail, and the old code discarded its output and claimed success anyway, so the
+    # loop repeated forever on a still-broken core.
+    File.write(COUNT, "0")
+    "claw: core failed to boot twice and the automatic revert FAILED.\n" \
+      "#{out.strip.lines.first(3).map { |l| "      #{l}" }.join}\n" \
+      "      Undo it by hand:  git -C #{ROOT} revert --no-edit #{sha}"
+  end
+end
+
+begin
+  require_relative "../lib/boot"
+  require "fileutils"
+  FileUtils.mkdir_p(File.dirname(COUNT))
+  File.write(COUNT, "0")
+rescue StandardError, ScriptError => e
+  # Not `Exception`: Interrupt (Ctrl-C during startup) and SystemExit are not boot
+  # failures, and counting them could revert a good commit because somebody pressed
+  # ^C. What matters -- LoadError, SyntaxError, NameError -- is StandardError/ScriptError.
+  n = boot_failures + 1
+  FileUtils.mkdir_p(File.dirname(COUNT))
+  File.write(COUNT, n.to_s)
+  if n >= 2
+    warn revert_core_commit
+  else
+    warn "claw: core failed to boot (#{n}/2).\n#{e.class}: #{e.message}"
+    warn "      If a core patch is to blame, running claw once more reverts it."
+  end
+  exit 1
+end
+
+require_relative "../lib/harness"
+require_relative "../lib/selftest"
+require_relative "../lib/consolidate"
+require_relative "../lib/telegram"
+require_relative "../lib/chat"
+require_relative "../lib/setup"
+require_relative "../lib/schedule"
+require_relative "../lib/work"
+require_relative "../lib/responsibility"
+require_relative "../lib/event"
+require_relative "../lib/heartbeat"
+require_relative "../lib/notify"
+require_relative "../lib/status"
+require_relative "../lib/update"
+
+# Model/endpoint overrides, resolved CLI flag > env > config.yml.
+# `--flag value`, removed from ARGV. Returns nil when the flag is absent.
+def take_flag(name)
+  i = ARGV.index(name) or return nil
+  val = ARGV[i + 1]
+  # `claw run --model` used to delete the flag and pass nil, so the real model was
+  # used silently; `--model --base-url x` ate the next flag.
+  if val.nil? || val.start_with?("--")
+    abort "claw: #{name} needs a value (e.g. claw run #{name} <value> \"<task>\")"
+  end
+
+  ARGV.delete_at(i + 1)
+  ARGV.delete_at(i)
+  val
+end
+
+# A bare switch, like `--once`: presence is the whole message. (take_flag on a bare
+# switch returns nil and deletes nothing, so `claw telegram --once` used to poll
+# forever, which is exactly what the flag exists to prevent.)
+def has_flag(name) = !ARGV.delete(name).nil?
+
+def model_opts
+  { model: take_flag("--model"), base_url: take_flag("--base-url") }
+end
+
+cmd = ARGV.shift
+
+# Anything that needs a model, on a machine that has never been configured, gets the
+# first-run wizard instead of a provider error nobody can act on.
+begin
+  if [nil, "run", "chat", "up", "serve"].include?(cmd) && RubyClaw::Setup.needed?
+    unless $stdin.tty?
+      abort "claw: no model configured. Run `claw setup` from a terminal, or set " \
+            "CLAW_MODEL / CLAW_BASE_URL / CLAW_API_KEY."
+    end
+    begin
+      case RubyClaw::Setup.run
+      when :serve then RubyClaw::Chat.new(**model_opts).serve
+      when :chat  then RubyClaw::Chat.new(**model_opts).repl
+      end
+    rescue RubyClaw::Error => e
+      abort "claw: #{e.message}"
+    rescue StandardError => e
+      abort "claw: setup hit an unexpected error (#{e.class}: #{e.message}). Nothing was written."
+    end
+    exit 0 if ARGV.empty? && cmd.nil?
+  end
+rescue RubyClaw::Error => e
+  abort "claw: #{e.message}"
+end
+
+begin
+case cmd
+when "probe"
+  # Used by SelfWrite.run_boot_probe: the harness reports that it is alive.
+  puts "BOOT_OK #{RubyClaw.tools.size} tools: #{RubyClaw.tools.keys.join(', ')}"
+when "selftest"
+  exit(RubyClaw::Selftest.run ? 0 : 1)
+when "tools"
+  RubyClaw.schemas.each do |s|
+    f = s[:function]
+    origin = RubyClaw.tools[f[:name]].origin
+    puts format("%-16s %-10s %s", f[:name], origin == "builtin" ? "[core]" : "[self]",
+                f[:description].to_s.split("\n").first[0, 96])
+  end
+when "notes"
+  RubyClaw::Notes.ensure!
+  kind = ARGV.shift
+  if kind
+    abort "claw: usage: claw notes [preference|memory] \"<line>\"" unless %w[preference memory].include?(kind)
+    text = ARGV.join(" ")
+    abort "claw: nothing to record" if text.empty?
+    puts RubyClaw::Notes.append(kind.to_sym, text)
+  else
+    RubyClaw::Notes::FILES.each do |k, p|
+      body = RubyClaw::Notes.read(k)
+      puts format("%-16s %s", File.basename(p), body.empty? ? "(empty)" : "#{body.lines.size} line(s)")
+      body.lines.reject { |l| l.start_with?("#", "<!--") }.last(6).each { |l| puts "  #{l.chomp}" }
+    end
+    sk = RubyClaw::Notes.skill_files
+    puts format("%-16s %s", "skills/", sk.empty? ? "(none)" : sk.keys.join(", "))
+    puts "\nadd: claw notes preference \"keep answers short\"   |   claw notes memory \"the printer is at .12\""
+  end
+when "stats"
+  inv = RubyClaw::Consolidate.inventory
+  RubyClaw::Consolidate.print_inventory(inv)
+  unused = inv.select { |t| t["calls"].zero? }
+  puts "\n#{inv.size} self-written tools, #{inv.sum { |t| t['calls'] }} recorded calls"
+  puts "never called: #{unused.map { |t| t['name'] }.join(', ')}" if unused.any?
+when "consolidate"
+  apply = !ARGV.delete("--apply").nil?
+  quiet = !ARGV.delete("--quiet").nil?
+  i = ARGV.index("--model")
+  ok = RubyClaw::Consolidate.run(apply: apply, quiet: quiet, model: i ? ARGV[i + 1] : nil)
+  exit(ok ? 0 : 1)
+when "update"
+  check = !ARGV.delete("--check").nil?
+  r = RubyClaw::Update.run(check: check)
+  puts r
+  # 0: up to date or applied. 2: updates are available (--check only, so a script can branch on
+  # "there is something new" without parsing prose). 1: it could not run.
+  exit(1) unless r.ok?
+  exit(check && r.updates? ? 2 : 0)
+when "evo"
+  f = File.join(RubyClaw::LOG_DIR, "evolution.jsonl")
+  exit(warn "no growth recorded yet") unless File.exist?(f)
+  File.readlines(f).last(20).each do |l|
+    e = JSON.parse(l) rescue next
+    puts format("%s %-6s %-20s %s", e["ts"][0, 16], e["kind"], e["name"], e["reason"].to_s[0, 70])
+  end
+when "rollback"
+  n = (ARGV.first || "1").to_i
+  abort "claw: usage: claw rollback [n] — n must be 1 or more" if n < 1
+  puts `git -C #{ROOT} log -#{n} --format=%H%x09%s`
+  # HEAD~n..HEAD is n commits. HEAD~#{n - 1}..HEAD is n-1, so the default `rollback`
+  # reverted nothing at all and printed a git error instead.
+  out = `git -C #{ROOT} revert --no-edit HEAD~#{n}..HEAD 2>&1`
+  if $?.success?
+    puts "\n#{out.strip}\nreverted #{n} commit(s). If a core file changed, restart claw."
+  else
+    abort "claw: revert failed:\n#{out.strip}"
+  end
+when "model"
+  puts "model    #{RubyClaw.model_name}"
+  puts "endpoint #{RubyClaw.base_url}"
+  puts "key      #{RubyClaw.api_key.to_s.empty? ? 'NOT SET' : 'set'} (#{RubyClaw.key_source})"
+  puts "\noverride per run:  claw run --model <name> --base-url <url> \"...\""
+  puts "or set CLAW_MODEL / CLAW_BASE_URL / CLAW_API_KEY in the environment or .env"
+  puts "config file: #{File.join(RubyClaw::ROOT, 'config.yml')}"
+when "telegram"
+  opts = model_opts
+  allowed = take_flag("--allowed")
+  once = has_flag("--once")
+  tg = RubyClaw::Telegram.new(**opts, allowed: allowed ? allowed.split(",") : nil)
+  tg.run(max_polls: once ? 1 : nil)
+when "schedule"
+  # claw schedule [list|add|remove|enable|disable|run|log|install-boot|remove-boot]
+  sub = ARGV.shift || "list"
+  S = RubyClaw::Schedule
+  case sub
+  when "list", "ls"
+    jobs = S.load
+    if jobs.empty?
+      puts "no schedules. add one:\n  claw schedule add morning-report \"daily 07:30\" 'date' --telegram"
+    else
+      jobs.each do |j|
+        state = j["enabled"] == false ? "paused" : (j["last_status"] || "never run")
+        nxt = S.next_run_display(j)
+        puts format("%-18s %-16s next %-16s %-9s %2d run(s)  %s %s",
+                    j["name"], S.describe(j), nxt, state, j["runs"].to_i, j["mode"],
+                    j["command"].to_s[0, 42])
+      end
+    end
+    puts "\nboot persistence: #{S.boot_installed? ? 'installed (cron)' : 'NOT installed — `claw schedule install-boot`'}"
+    puts "bot at boot:      #{S.serve_installed? ? 'installed (cron)' : 'NOT installed — `claw schedule install-boot --serve`'}"
+  when "add"
+    name = ARGV.shift or abort "claw: usage: claw schedule add <name> <spec> <command> [--task] [--telegram] [--timeout N]"
+    spec = ARGV.shift or abort "claw: usage: claw schedule add <name> <spec> <command>"
+    mode = ARGV.delete("--task") ? "task" : "shell"
+    deliver = ARGV.delete("--telegram") ? "telegram" : "log"
+    timeout = take_flag("--timeout")
+    command = ARGV.join(" ")
+    abort "claw: the schedule needs a command to run" if command.empty?
+    job = S.add(name: name, spec: spec, command: command, mode: mode, deliver: deliver,
+                timeout: timeout&.to_i)
+    puts "added #{job['name']}: #{S.describe(job)} (#{job['mode']}, delivered to #{job['deliver']})"
+    puts "due now, so it runs on the next tick — `claw schedd --once`, or `claw up`, or cron"
+    puts "make it survive a reboot:  claw schedule install-boot   (adds a crontab block)"
+  when "remove", "rm", "delete"
+    name = ARGV.shift or abort "claw: usage: claw schedule remove <name>"
+    abort "claw: no schedule called #{name}" unless S.remove(name)
+    puts "removed #{name}"
+  when "enable", "disable"
+    name = ARGV.shift or abort "claw: usage: claw schedule #{sub} <name>"
+    job = S.set_enabled(name, sub == "enable")
+    puts "#{sub}d #{name} (next run #{S.next_run_display(job)})"
+  when "run"
+    name = ARGV.shift or abort "claw: usage: claw schedule run <name>"
+    job = S.load.find { |j| j["name"] == name } or abort "claw: no schedule called #{name}"
+    r = S.run_job(job)
+    puts "#{r['name']}: #{r['ok'] ? 'ok' : 'FAILED'} in #{r['seconds']}s"
+    puts r["output"].to_s.strip[0, 2000]
+    exit(r["ok"] ? 0 : 1)
+  when "log"
+    name = ARGV.shift or abort "claw: usage: claw schedule log <name>"
+    path = S.log_path(name)
+    abort "claw: no log for #{name} yet (#{path})" unless File.exist?(path)
+    puts File.readlines(path).last((ARGV.first || 40).to_i).join
+  when "install-boot"
+    interval = (take_flag("--every") || 5).to_i
+    # --serve also arms the Telegram bot, so "leave it running" means across a reboot and not
+    # just until the next one. Same crontab block machinery: no root, and removable by name.
+    serve = has_flag("--serve")
+    puts S.install_boot(interval: interval, serve: serve)
+    puts "\ninstalled in your crontab: the scheduler at boot and every #{interval} minute(s) if the"
+    puts "machine stays up#{serve ? ", plus the bot itself at boot (--serve)" : ''}."
+    puts "Remove it with `claw schedule remove-boot#{serve ? ' --serve' : ''}`."
+  when "remove-boot"
+    # Read the flag once: has_flag consumes it, and asking twice made this line report one
+    # block removed when it had just removed two.
+    serve = has_flag("--serve")
+    S.remove_boot(serve: serve)
+    puts "removed the rubyclaw block#{serve ? "s" : ''} from your crontab (other lines untouched)"
+  else
+    abort "claw: usage: claw schedule [list|add|remove|enable|disable|run|log|install-boot|remove-boot]"
+  end
+when "work"
+  # claw work [list|add|state|reopen|show|history|artifact|request|decide]
+  # The text view is the whole point of a bare `claw work`; the rest are small verbs so the
+  # store is usable from a terminal and not only by the model.
+  sub = ARGV.shift || "list"
+  W = RubyClaw::Work
+  case sub
+  when "list", "ls", "view"
+    puts W.render
+  when "add"
+    project = take_flag("--project")
+    title = ARGV.join(" ").strip
+    abort "claw: usage: claw work add \"<title>\" [--project P]" if title.empty?
+    t = W.add_task(title: title, project: project)
+    puts "queued #{t['id']}: #{t['title']}"
+  when "state"
+    id = ARGV.shift or abort "claw: usage: claw work state <id> <STATE> [note...]"
+    state = ARGV.shift or abort "claw: usage: claw work state <id> <STATE> [note...]"
+    t = W.set_state(id, state, note: ARGV.join(" "))
+    puts "#{t['id']} is now #{t['state']}"
+  when "reopen"
+    id = ARGV.shift or abort "claw: usage: claw work reopen <id> [note...]"
+    t = W.reopen(id, note: ARGV.join(" "))
+    puts "reopened #{t['id']} -> QUEUED"
+  when "show"
+    id = ARGV.shift or abort "claw: usage: claw work show <id>"
+    t = W.find_task(id) or abort "claw: no task #{id}"
+    puts W.task_line(t)
+    W.artifacts_for(id).each { |x| puts "  artifact: #{x['id']} [#{x['type']}] #{x['title']} — #{x['location']}" }
+    W.history(id).each { |l| puts "  #{l}" }
+  when "history"
+    id = ARGV.shift or abort "claw: usage: claw work history <id>"
+    puts W.history(id)
+  when "artifact"
+    type = ARGV.shift or abort "claw: usage: claw work artifact <type> <title> <location> [task_id]"
+    title = ARGV.shift or abort "claw: usage: claw work artifact <type> <title> <location> [task_id]"
+    location = ARGV.shift or abort "claw: usage: claw work artifact <type> <title> <location> [task_id]"
+    art = W.register_artifact(type: type, title: title, location: location, task_id: ARGV.shift,
+                              created_by: "human")
+    puts "registered #{art['id']}: #{art['title']}#{art['task_id'] ? " (task #{art['task_id']})" : ''}"
+  when "request"
+    id = ARGV.shift or abort "claw: usage: claw work request <task_id> <what needs approving>"
+    what = ARGV.join(" ").strip
+    abort "claw: an approval needs an action to approve" if what.empty?
+    ap = W.request_approval(task_id: id, action: what)
+    puts "waiting on a human: #{ap['id']} — #{ap['action']} (task #{ap['task_id']})"
+  when "decide"
+    id = ARGV.shift or abort "claw: usage: claw work decide <approval_id> granted|denied [--by name]"
+    decision = ARGV.shift or abort "claw: usage: claw work decide <approval_id> granted|denied [--by name]"
+    ap = W.decide_approval(id, decision, by: take_flag("--by"))
+    puts "#{ap['id']} #{ap['status']} by #{ap['decided_by']} — task #{ap['task_id']} is now " \
+         "#{W.find_task(ap['task_id'])&.fetch('state', '?')}"
+  else
+    abort "claw: usage: claw work [list|add|state|reopen|show|history|artifact|request|decide]"
+  end
+when "status"
+  # The operator view: what is waiting on a person, what is running, what failed and why,
+  # what is stale, and the harness's own vitals (bot, scheduler, heartbeat last pass,
+  # notification queue, disk). Text, not a UI -- a dashboard is out of scope.
+  print RubyClaw::Status.render
+when "notify"
+  # claw notify [test [--chat N] | drain | queue]
+  # The escape hatch: prove delivery works end to end, retry the durable queue, or read
+  # what is waiting in it. Only an allowlisted chat is ever a destination.
+  sub = ARGV.shift || "test"
+  N = RubyClaw::Notify
+  case sub
+  when "test"
+    r = N.test_message(chat: take_flag("--chat"))
+    if r["error"]
+      warn "claw: #{r['error']}"
+      puts "notification queue depth: #{r['queued']} — nothing was sent"
+      exit 1
+    end
+    puts "sent a test notification to chat #{r['target'].join(', ')} (#{r['sent']} message(s))"
+  when "drain"
+    print N.render_drain(N.drain(Time.now))
+  when "queue", "list"
+    print N.render_queue
+  else
+    abort "claw: usage: claw notify [test [--chat N] | drain | queue]"
+  end
+when "schedd"
+  once = has_flag("--once")
+  poll = (take_flag("--poll") || 30).to_i
+  RubyClaw::Schedule.daemon(
+    poll: poll, once: once,
+    on_tick: proc do |r|
+      note = r["held"] ? "held by policy" : "#{r['ok'] ? 'ok' : 'FAILED'} in #{r['seconds']}s"
+      puts "#{Time.now.strftime('%H:%M:%S')} #{r['name']}: #{note}"
+    end,
+    # The heartbeat rides the scheduler's tick: pending events become tasks, waiting work
+    # resumes, stuck work is retried. It makes no model call (see lib/heartbeat.rb).
+    on_pass: proc { RubyClaw::Heartbeat.pass }
+  )
+when "heartbeat"
+  poll = take_flag("--poll")
+  if poll
+    puts "heartbeat every #{poll.to_i}s (Ctrl-C to stop)"
+    RubyClaw::Schedule.daemon(poll: poll.to_i, on_pass: proc { print RubyClaw::Heartbeat.render(RubyClaw::Heartbeat.pass) })
+  else
+    print RubyClaw::Heartbeat.render(RubyClaw::Heartbeat.pass)
+  end
+when "resp", "responsibility"
+  # claw resp [list|add|show|enable|disable|remove]
+  sub = ARGV.shift || "list"
+  resp_mod = RubyClaw::Responsibility
+  work_mod = RubyClaw::Work
+  case sub
+  when "list", "ls", "view"
+    print resp_mod.render
+  when "add"
+    triggers = []
+    triggers << take_flag("--trigger") while ARGV.include?("--trigger")
+    owner = take_flag("--owner")
+    project = take_flag("--project")
+    skill = take_flag("--skill")
+    autonomy = take_flag("--autonomy") || "ask"
+    reporting = take_flag("--reporting") || "on_completion"
+    objective = ARGV.join(" ").strip
+    abort "claw: usage: claw resp add \"<objective>\" [--trigger T ...] [--owner O] [--project P] " \
+          "[--skill S] [--autonomy auto|ask] [--reporting ...]" if objective.empty?
+    resp = resp_mod.add(objective: objective, owner: owner, project: project, skill: skill,
+                        autonomy: autonomy, reporting: reporting, triggers: triggers)
+    puts "added #{resp['id']}: #{resp['objective']}"
+    resp["triggers"].each { |t| puts "  trigger #{t['id']}  #{resp_mod.describe_trigger(t)}" }
+    puts "  a timer fires on the next heartbeat: `claw heartbeat`"
+  when "show"
+    id = ARGV.shift or abort "claw: usage: claw resp show <id>"
+    r = resp_mod.find(id) or abort "claw: no responsibility #{id}"
+    puts "#{r['id']}  #{r['objective']}  (#{r['enabled'] == false ? 'paused' : 'active'})"
+    puts "  owner=#{r['owner']} project=#{r['project']} skill=#{r['skill']} " \
+         "autonomy=#{r['autonomy']} reporting=#{r['reporting']}"
+    (r["triggers"] || []).each { |t| puts "  trigger #{t['id']}  #{resp_mod.describe_trigger(t)}  #{t['next_run']}" }
+    work_mod.tasks_for_responsibility(id).each { |t| puts "  #{t['id']} #{t['state']} #{t['title']}" }
+  when "enable", "disable"
+    id = ARGV.shift or abort "claw: usage: claw resp #{sub} <id>"
+    r = work_mod.set_responsibility_enabled(id, sub == "enable")
+    puts "#{sub}d #{r['id']}"
+  when "remove", "rm", "delete"
+    id = ARGV.shift or abort "claw: usage: claw resp remove <id>"
+    abort "claw: no responsibility #{id}" unless work_mod.remove_responsibility(id)
+    puts "removed #{id}"
+  else
+    abort "claw: usage: claw resp [list|add|show|enable|disable|remove]"
+  end
+when "event"
+  # claw event post <type> [--source S] [--key K] [--payload JSON]
+  # The submission seam for an inbound hook: another process (a git hook, a webhook
+  # shim, a person) posts a normalised event, and the heartbeat turns it into a task if a
+  # responsibility matches. No socket is opened here; see REVIEW.md.
+  sub = ARGV.shift || "post"
+  abort "claw: usage: claw event post <type> [--source S] [--key K] [--payload JSON]" unless sub == "post"
+  type = ARGV.shift or abort "claw: usage: claw event post <type> ..."
+  source = take_flag("--source")
+  key = take_flag("--key")
+  payload = take_flag("--payload")
+  begin
+    parsed = payload ? JSON.parse(payload) : {}
+  rescue JSON::ParserError => e
+    abort "claw: --payload is not JSON (#{e.message})"
+  end
+  parsed["source"] ||= source if source
+  ev = RubyClaw::Event.submit(type: type, payload: parsed, source: source, key: key)
+  puts ev["duplicate"] ? "duplicate: #{ev['key']} is already queued or handled" : "queued #{ev['id']} key=#{ev['key']}"
+  puts "it becomes a task on the next `claw heartbeat` if a responsibility matches it"
+
+when "run"
+  opts = model_opts                 # must come first: it removes the flags from ARGV
+  task = ARGV.join(" ")
+  abort "usage: claw run \"<task>\"" if task.empty?
+  h = RubyClaw::Harness.new(**opts)
+  t0 = Time.now
+  answer = h.run(task)
+  puts "\n#{answer}\n\n#{h.usage_line} in #{format('%.1fs', Time.now - t0)}"
+when "setup"
+  begin
+    case RubyClaw::Setup.run(non_interactive: !ARGV.delete("--non-interactive").nil?,
+                             force_tty: !ARGV.delete("--interactive").nil?)
+    when :serve then RubyClaw::Chat.new(**model_opts).serve
+    when :chat  then RubyClaw::Chat.new(**model_opts).repl
+    end
+  rescue StandardError => e
+    abort "claw: setup hit an unexpected error (#{e.class}: #{e.message}). Nothing was written."
+  end
+when "chat"
+  RubyClaw::Chat.new(**model_opts).repl
+when "up", "serve"
+  # Telegram in a thread, local prompt in the foreground: leave it running and it
+  # answers from your phone without giving up the shell. --telegram-only drops the prompt,
+  # which is what a service (systemd, launchd, a container) needs -- there is no stdin there.
+  service = has_flag("--telegram-only") || has_flag("--no-prompt")
+  keeper = has_flag("--if-not-running")
+  code = RubyClaw::Chat.new(**model_opts).serve(telegram_only: service, if_not_running: keeper)
+  exit(code) if code.is_a?(Integer)
+when nil
+  RubyClaw::Chat.new(**model_opts).repl
+else
+  abort <<~USAGE
+    claw <command>
+      (nothing)      interactive chat
+      setup          first-run wizard: model endpoint and Telegram (--non-interactive
+                     reads CLAW_MODEL / CLAW_BASE_URL / CLAW_API_KEY from the env)
+      up             Telegram bot + local prompt + scheduler, in the foreground
+                     --telegram-only runs the bot without the prompt (for a service)
+      schedule       recurring jobs: list|add|remove|enable|disable|run|log
+                     ...and install-boot, which puts them in cron so a reboot is
+                     harmless (`claw schedule install-boot`; remove-boot undoes it).
+                     --serve also brings the Telegram bot back at boot
+      schedd         the scheduler itself (--once for a cron tick, --poll N)
+      heartbeat      one pass of unattended work: pending events -> tasks, resume
+                     waiting work, retry stuck work, park what needs a person.
+                     No model call. Also runs on the scheduler's tick (--poll N loops)
+      notify         tell a person, and prove it works: `claw notify test` sends one
+                     message to the allowlisted chat, `queue` shows what could not be
+                     sent, `drain` retries it. Never an unlisted chat.
+      resp           standing commitments: list|add|show|enable|disable|remove.
+                     `claw resp add "keep the notes current" --trigger "timer daily 07:00"`
+      event post     submit a unified event (the inbound-hook seam); the heartbeat
+                     turns it into a task if a responsibility's trigger matches it
+      work           tasks, artifacts and approvals that live outside the chat.
+                     `claw work` is the text view: what is queued, what is stuck,
+                     what is waiting on you, and the artifacts by task. Verbs:
+                     add|state|reopen|show|history|artifact|request|decide
+      status         the operator view: what is waiting on you (with the exact command),
+                     what runs, what failed and why, what is stale, and the harness's own
+                     health — bot, scheduler, last heartbeat, notification queue, disk
+      telegram       the bot alone (--once to smoke-test the token)
+      run "<task>"   one-shot task, prints the answer
+      chat           interactive chat (same as no arguments)
+      tools          list the tool surface
+      stats          per-tool usage: calls, errors, age, idle time
+      consolidate    audit tools/ for duplicates to merge or retire
+                     (--apply executes the plan; default is a dry run)
+      evo            what the harness has grown (log/evolution.jsonl)
+      update         self-update from the home repo: take what upstream changed unless this
+                     instance has changed that path itself, which is kept and reported
+                     (--check reports without applying; takes effect at the next start)
+      rollback [n]   revert the last n self-commits
+      model          show the resolved model, endpoint and key source
+      notes          what it has learned: preferences.md, memory.md, skills/
+      telegram       Telegram bot only, no local prompt (long polling; see README)
+      selftest       exercise the self-write pipeline (run after core patches)
+      probe          boot check, used by the core-patch validator
+  USAGE
+end
+rescue RubyClaw::Error => e
+  abort "claw: #{e.message}"     # e.g. a provider 4xx or a missing token
+rescue StandardError => e
+  # A sentence beats a backtrace on a machine somebody is leaving unattended.
+  raise if ENV["CLAW_DEBUG"].to_s == "1"
+  abort "claw: #{e.class}: #{e.message}\n      (CLAW_DEBUG=1 for the full backtrace)"
+end
