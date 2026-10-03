@@ -298,3 +298,9 @@ of that makes it wise. Read it before you rely on it.
 only condition is the usual one: keep the copyright notice. See [LICENSE](LICENSE).
 
 Contributions are welcome and are licensed under the same terms.
+
+## How releases are made
+
+Every change lands on its own branch and is merged into `main` with a merge commit, so the
+history shows what changed, when, and in what order. Nothing is squashed. Each merge to
+`main` bumps the **minor** version in `VERSION` (`0.1.0-alpha` -> `0.2.0-alpha`).
