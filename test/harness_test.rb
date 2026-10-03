@@ -114,4 +114,24 @@ class HarnessTest < Minitest::Test
     assert st.success?, out
     assert_match(/SENTENCE: provider returned 401/, out)
   end
+
+  # The soul may gain personality, but it must not lose the rules the harness already
+  # stands on -- and it must not bloat: every character here rides every request.
+  def test_the_default_soul_keeps_its_rules_and_stays_tight
+    soul = RubyClaw::Harness::DEFAULT_SOUL
+    {
+      "answer first" => /Answer first/,
+      "yes/no answered by the first word" => /first word is yes or no/,
+      "no preamble" => /No preamble/,
+      "no hedging" => /No hedging theatre/,
+      "a wrap-up block at the end" => /WRAP-UP/,
+      "never pad" => /Never pad/,
+      "bad news travels first" => /Bad news travels first/,
+      "never invent results" => /Never invent results/,
+      '"it works" means you ran it' => /"it works" means you ran it/,
+      "the new character" => /not a corporate assistant/,
+      "the new instinct to volunteer" => /Volunteer\./
+    }.each { |name, re| assert_match re, soul, "the soul must keep saying: #{name}" }
+    assert_operator soul.length, :<, 2400, "the soul must stay tight, not sprawl (#{soul.length} chars)"
+  end
 end

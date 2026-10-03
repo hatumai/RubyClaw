@@ -143,11 +143,13 @@ module RubyClaw
       loop do
         return 0 if @stopping
 
-        # A bot thread that died must not leave this process parked. The keeper's "already running"
-        # check would go on saying yes and the chat would be silently dead -- measured on the test
-        # bed, where a TLS handshake starved by load timed out every poll, the bot gave up after
-        # six, and the service sat there looking healthy with no bot at all. Exit non-zero instead,
-        # so the keeper's next run brings it back and a supervisor sees a real failure.
+        # A bot thread that died must not leave this process parked. The keeper's
+        # "already running" check would go on saying yes and the chat would be silently
+        # dead. A transient poll failure no longer kills the bot -- the poller backs off
+        # and keeps trying forever -- so a dead thread now means a fatal fault (a bad
+        # token) or a real crash, and either way the service should not sit there looking
+        # healthy with no bot. Exit non-zero instead, so the keeper's next run brings it
+        # back and a supervisor sees a real failure.
         if bot && !bot.alive?
           warn "rubyclaw: the bot stopped; exiting so the keeper starts it again"
           return 1
