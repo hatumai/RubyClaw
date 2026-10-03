@@ -251,11 +251,13 @@ class ChatTest < Minitest::Test
     Process.wait(pid) rescue nil
   end
 
-  # The bot gives up after repeated poll failures, and the service must not survive it: parked with
-  # a dead bot, the keeper's "already running" check answers yes forever and the chat is silently
-  # dead. That is what happened on the test bed under load, so the failure is now a non-zero exit.
+  # A bot thread that dies must not leave the service parked: with a dead bot, the
+  # keeper's "already running" check answers yes forever and the chat is silently dead.
+  # A 401 mid-poll is the one genuinely fatal poll failure -- a bad token cannot start
+  # working by being retried -- so the poller stops and the service exits non-zero.
   def test_service_mode_exits_when_the_bot_thread_dies
-    tg = ClawTest::FakeTG.new(errors: { "getUpdates" => "this API never works" })
+    tg = ClawTest::FakeTG.new(errors: { "getUpdates" => "Unauthorized" },
+                              statuses: { "getUpdates" => 401 })
     env = { "CLAW_TELEGRAM_API_BASE" => tg.base, "CLAW_TELEGRAM_TOKEN" => "stub",
             "CLAW_MODEL" => "test-model", "CLAW_BASE_URL" => "http://127.0.0.1:1/v1",
             "CLAW_API_KEY" => "x", "CLAW_TG_MAX_FAILURES" => "1" }
@@ -266,8 +268,35 @@ class ChatTest < Minitest::Test
 
     refute status.success?, "a service with no bot must not exit zero"
     out = File.read(log)
+    assert_match(/Telegram rejected the credentials/, out, "it must say why the bot stopped")
     assert_match(/the bot stopped/, out)
     refute File.exist?(@sb.path("data", "serve.pid")), "and it must give the claim back"
+  ensure
+    Process.kill("KILL", pid) rescue nil
+    Process.wait(pid) rescue nil
+    tg&.stop
+  end
+
+  # The reported bug, at the level a person feels it: a transient poll outage used to make
+  # the bot give up and the service exit, so it went silent until somebody restarted it.
+  # Now the poller backs off and keeps trying, so the service stays up and the bot is
+  # there when the network comes back.
+  def test_service_mode_rides_out_a_transient_poll_outage
+    tg = ClawTest::FakeTG.new(fail_polls: 3)
+    env = { "CLAW_TELEGRAM_API_BASE" => tg.base, "CLAW_TELEGRAM_TOKEN" => "stub",
+            "CLAW_MODEL" => "test-model", "CLAW_BASE_URL" => "http://127.0.0.1:1/v1",
+            "CLAW_API_KEY" => "x", "CLAW_TG_MAX_FAILURES" => "1" }
+    log = @sb.path("log", "botoutage.log")
+    pid = Process.spawn(env, ClawTest::RUBY, @sb.path("bin/claw"), "up", "--telegram-only",
+                        chdir: @sb.dir, in: File::NULL, out: log, err: log)
+    # Long enough to have failed several polls and crossed the notice threshold; it must
+    # still be running, not exited.
+    sleep 6
+    assert Process.waitpid(pid, Process::WNOHANG).nil?,
+           "a transient outage must not take the service down:\n#{File.read(log)}"
+    Process.kill("TERM", pid)
+    _, status = Process.wait2(pid)
+    assert_equal 0, status.exitstatus, "a clean stop should still be clean"
   ensure
     Process.kill("KILL", pid) rescue nil
     Process.wait(pid) rescue nil

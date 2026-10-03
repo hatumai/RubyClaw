@@ -308,4 +308,113 @@ class TelegramTest < Minitest::Test
   ensure
     sb&.cleanup
   end
+
+  # ---- surviving a bad network, and saying so ------------------------------
+  #
+  # Outbound TLS to api.telegram.org times out intermittently on the armv6 board. The
+  # reported bug: six consecutive failed polls raised and killed the poller, so the bot
+  # went silent for good. These drive the real loop in a sandbox child (its
+  # notifications land in the sandbox's own data/) against a FakeTG in this process.
+
+  # Drive RubyClaw::Telegram#run in a sandbox child, pointed at @tg, and return
+  # [output, status]. max_failures is small so a notice is reached without waiting out
+  # the full backoff.
+  def drive_poller(sb, max_polls: 5, max_failures: 1)
+    code = <<~RB
+      require "telegram"
+      tg = RubyClaw::Telegram.new(allowed: ["42"])
+      puts "POLLS=\#{tg.run(max_polls: #{max_polls})}"
+    RB
+    env = { "CLAW_TELEGRAM_API_BASE" => @tg.base, "CLAW_TELEGRAM_TOKEN" => "stub",
+            "CLAW_TELEGRAM_ALLOWED" => "42", "CLAW_TG_MAX_FAILURES" => max_failures.to_s }
+    sb.ruby(code, env: env)
+  end
+
+  def test_a_transient_poll_failure_does_not_stop_the_poller
+    @tg.stop
+    @tg = FakeTG.new(updates: [FakeTG.message(42, "/help")], fail_polls: 2)
+    sb = Sandbox.new("tgsurvive")
+    out, st = drive_poller(sb, max_polls: 5, max_failures: 1)
+    assert st.success?, out
+    assert_match(/POLLS=5/, out, "the loop must run every poll, not die at the failure limit:\n#{out}")
+    refute_match(/stopping —/, out, "a transient outage must not stop the poller")
+    assert(@tg.texts.any? { |t| t.include?("/prefer") },
+           "a message queued behind the outage was finally answered:\n#{@tg.texts.inspect}")
+  ensure
+    sb&.cleanup
+  end
+
+  # The one fatal poll failure: a revoked token cannot start working by being retried,
+  # so the loop stops, says why in one line, and does not poll on.
+  def test_a_bad_token_during_polling_stops_the_loop_and_says_why
+    @tg.stop
+    @tg = FakeTG.new(errors: { "getUpdates" => "Unauthorized" }, statuses: { "getUpdates" => 401 })
+    ENV["CLAW_TELEGRAM_API_BASE"] = @tg.base
+    a = adapter(allowed: "42")
+    out, err = capture { a.run(max_polls: 3) }
+    assert_match(/stopping — Telegram rejected the credentials/, err, "it must say why it stopped")
+    assert_match(/401|Unauthorized/, err)
+    assert_match(/CLAW_TELEGRAM_TOKEN/, err, "and name the fix")
+    assert_equal 1, @tg.calls.count("getUpdates"), "a bad token stops the loop instead of hammering it"
+    refute_match(/poll failed/, err, "a 401 is not a transient poll failure")
+  ensure
+    nil
+  end
+
+  def test_the_unreachable_notice_fires_once_not_once_per_failed_poll
+    @tg.stop
+    @tg = FakeTG.new(updates: [FakeTG.message(42, "/help")], fail_polls: 2)
+    sb = Sandbox.new("tgonce")
+    out, st = drive_poller(sb, max_polls: 5, max_failures: 1)
+    assert st.success?, out
+    notices = @tg.texts.count { |t| t.include?("can't reach Telegram") }
+    assert_equal 1, notices, "two failed polls past the threshold but one notice:\n#{@tg.texts.inspect}"
+  ensure
+    sb&.cleanup
+  end
+
+  def test_the_recovery_notice_fires_when_polls_resume
+    @tg.stop
+    @tg = FakeTG.new(updates: [FakeTG.message(42, "/help")], fail_polls: 1)
+    sb = Sandbox.new("tgrecover")
+    out, st = drive_poller(sb, max_polls: 4, max_failures: 1)
+    assert st.success?, out
+    assert_equal 1, @tg.texts.count { |t| t.include?("can't reach Telegram") }, out
+    assert_equal 1, @tg.texts.count { |t| t.include?("back in touch") },
+                 "the recovery is announced exactly once:\n#{@tg.texts.inspect}\n#{out}"
+  ensure
+    sb&.cleanup
+  end
+
+  # ---- never look dead while it works --------------------------------------
+
+  # A long model turn used to send nothing until the answer, which reads as a bot that
+  # ignored you. The typing indicator goes out immediately and precedes the answer; and
+  # it is the indicator, not a chatty "on it!" message.
+  def test_a_typing_action_is_sent_before_the_answer
+    @llm = FakeLLM.new(script: [FakeLLM.says("done")])
+    a = adapter(allowed: "42", base_url: @llm.base_url, api_key: "x", model: "fake")
+    queue("do the thing")
+    capture { a.run(max_polls: 1) }
+    assert_includes @tg.calls, "sendChatAction"
+    action_at = @tg.calls.index("sendChatAction")
+    answer_at = @tg.calls.index("sendMessage")
+    refute_nil answer_at, "the answer must be sent"
+    assert_operator action_at, :<, answer_at, "the typing indicator must precede the answer"
+    assert_equal ["done"], @tg.texts, "no 'on it!' message — only the answer carries the voice"
+  end
+
+  # If Telegram will not take the indicator, the work and the answer must not be lost.
+  def test_a_failed_typing_action_does_not_lose_the_answer
+    @tg.stop
+    @tg = FakeTG.new(errors: { "sendChatAction" => "typing not allowed" })
+    ENV["CLAW_TELEGRAM_API_BASE"] = @tg.base
+    @llm = FakeLLM.new(script: [FakeLLM.says("the answer, delivered anyway")])
+    a = adapter(allowed: "42", base_url: @llm.base_url, api_key: "x", model: "fake")
+    queue("say something")
+    capture { a.run(max_polls: 1) }
+    assert_includes @tg.calls, "sendChatAction", "the indicator was attempted"
+    assert_match(/the answer, delivered anyway/, @tg.texts.last,
+                 "a rejected typing action must not cost the answer")
+  end
 end

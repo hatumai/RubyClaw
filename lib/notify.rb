@@ -202,6 +202,47 @@ module RubyClaw
         result
       end
 
+      # ---- a condition the harness raises itself ----------------------------
+      #
+      # Not every notification comes from the work log. The poll loop telling a person it
+      # cannot reach Telegram is one, and it rides the same queue and the same seen-ledger
+      # rather than inventing a second path: keying it by the condition and recording the
+      # key once is exactly what keeps an outage to one message instead of one per failed
+      # poll. `rearm` drops a key once its condition is over, so a *later* outage can be
+      # announced again instead of being deduped into silence forever.
+      def signal(key, text, now: Time.now)
+        chats = allowed_chats
+        return false if chats.empty?
+
+        queued = false
+        Work.with_lock do
+          st = Work.notifications_store
+          unless (st["seen"] || {}).key?(key)
+            chats.each do |chat|
+              st["queue"] = (st["queue"] << queued_item(chat, { "text" => text, "condition" => nil },
+                                                        key, now)).last(QUEUE_MAX)
+            end
+            st["seen"] = trim_seen((st["seen"] || {}).merge(key => now.utc.iso8601))
+            Work.save_notifications(st)
+            queued = true
+          end
+        end
+        drain(now) if queued
+        queued
+      end
+
+      # Is the condition keyed by `key` still in force (signalled and not re-armed)? The
+      # ledger is the only state, so there is no second flag to drift out of sync with it.
+      def signalled?(key) = (Work.notifications_store["seen"] || {}).key?(key)
+
+      def rearm(key)
+        Work.with_lock do
+          st = Work.notifications_store
+          st["seen"] = (st["seen"] || {}).reject { |k, _| k == key }
+          Work.save_notifications(st)
+        end
+      end
+
       # ---- the one thing that actually sends --------------------------------
 
       # True, or false and why. A missing token is a failure, not a crash: the harness

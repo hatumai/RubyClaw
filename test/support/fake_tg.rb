@@ -14,17 +14,23 @@ module ClawTest
 
     def initialize(updates: [], user: { "id" => 1, "is_bot" => true, "first_name" => "stub",
                                         "username" => "stub_bot" },
-                   hold: false, errors: {}, delay: 0, fail_sends: 0)
+                   hold: false, errors: {}, statuses: {}, delay: 0, fail_sends: 0,
+                   fail_polls: 0)
       @queue = updates.dup
       @user = user
       @hold = hold                 # true: getUpdates always returns the same update
       @errors = errors             # method => description, for failure paths
+      @statuses = statuses         # method => HTTP status to answer with (e.g. 401)
       @delay = delay               # seconds to sit on every reply: a *slow* API, for races that
                                    # only exist while a client is still connecting
       # The armv6 board's outbound TLS times out intermittently. This makes the FIRST
       # `fail_sends` sendMessage calls fail and the rest succeed, so a test can prove a
       # failed send is queued and then delivered rather than lost.
       @fail_sends = fail_sends
+      # ...and the same for polls: the FIRST `fail_polls` getUpdates calls answer 503, as
+      # a wedged link does, and the rest succeed. A test can then prove the poller rides
+      # out a transient outage (and that the notice fires once, not once per failure).
+      @fail_polls = fail_polls
       @sent = []
       @calls = []
       @edits = []                  # editMessageText / editMessageReplyMarkup payloads
@@ -97,8 +103,10 @@ module ClawTest
       method = line.split(" ")[1].to_s.split("/").last
       @mutex.synchronize { @calls << method }
       sleep @delay if @delay.positive?
-      payload = JSON.generate(method_result(method, params))
-      sock.write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" \
+      status, result = method_result(method, params)
+      payload = JSON.generate(result)
+      reason = status == 200 ? "OK" : (status == 401 ? "Unauthorized" : "Error")
+      sock.write("HTTP/1.1 #{status} #{reason}\r\nContent-Type: application/json\r\n" \
                  "Content-Length: #{payload.bytesize}\r\nConnection: close\r\n\r\n#{payload}")
     rescue StandardError
       nil
@@ -107,10 +115,20 @@ module ClawTest
     end
 
     def method_result(method, params)
-      return { "ok" => false, "description" => @errors[method] } if @errors.key?(method)
+      if @errors.key?(method)
+        status = @statuses[method] || 200
+        return [status, { "ok" => false, "error_code" => (@statuses[method] || 400),
+                          "description" => @errors[method] }]
+      end
       case method
-      when "getMe" then { "ok" => true, "result" => @user }
+      when "getMe" then [200, { "ok" => true, "result" => @user }]
       when "getUpdates"
+        # A transient outage: answer 503 until the budget runs out, then behave.
+        failed = @mutex.synchronize { @fail_polls.positive? && (@fail_polls -= 1) }
+        if failed
+          return [503, { "ok" => false, "error_code" => 503,
+                         "description" => "simulated transient outage" }]
+        end
         out = @mutex.synchronize do
           @get_updates_params << params.dup
           if @hold
@@ -121,7 +139,7 @@ module ClawTest
             q
           end
         end
-        { "ok" => true, "result" => out }
+        [200, { "ok" => true, "result" => out }]
       when "sendMessage"
         fail_now = @mutex.synchronize do
           if @fail_sends.positive?
@@ -133,28 +151,28 @@ module ClawTest
             false
           end
         end
-        return { "ok" => false, "description" => "simulated send failure" } if fail_now
+        return [200, { "ok" => false, "description" => "simulated send failure" }] if fail_now
 
-        { "ok" => true, "result" => { "message_id" => @sent.size } }
+        [200, { "ok" => true, "result" => { "message_id" => @sent.size } }]
       when "editMessageText"
         @mutex.synchronize do
           @edits << { chat_id: params["chat_id"], message_id: params["message_id"],
                       text: params["text"].to_s, reply_markup: params["reply_markup"] }
         end
-        { "ok" => true, "result" => { "message_id" => params["message_id"] } }
+        [200, { "ok" => true, "result" => { "message_id" => params["message_id"] } }]
       when "editMessageReplyMarkup"
         @mutex.synchronize do
           @edits << { chat_id: params["chat_id"], message_id: params["message_id"],
                       reply_markup: params["reply_markup"], text: nil }
         end
-        { "ok" => true, "result" => { "message_id" => params["message_id"] } }
+        [200, { "ok" => true, "result" => { "message_id" => params["message_id"] } }]
       when "answerCallbackQuery"
         @mutex.synchronize do
           @answers << { callback_query_id: params["callback_query_id"], text: params["text"].to_s }
         end
-        { "ok" => true, "result" => true }
-      when "sendChatAction" then { "ok" => true, "result" => true }
-      else { "ok" => false, "description" => "unknown method #{method}" }
+        [200, { "ok" => true, "result" => true }]
+      when "sendChatAction" then [200, { "ok" => true, "result" => true }]
+      else [200, { "ok" => false, "description" => "unknown method #{method}" }]
       end
     end
   end

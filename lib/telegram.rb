@@ -12,12 +12,33 @@
 require_relative "harness"
 require_relative "consolidate"
 require_relative "work"
+require "openssl"   # named on its own so a TLS failure is a class the poll loop can hold
 
 module RubyClaw
   class Telegram
     MAX_MSG = 4000          # Telegram's hard limit is 4096; leave room for a marker
     POLL_TIMEOUT = 50       # seconds the server holds an empty long-poll open
-    MAX_FAILURES = 6        # consecutive failed polls before giving up (~3 min of backoff)
+    MAX_FAILURES = 6        # consecutive failed polls before a PERSON is told (the loop lives on)
+    TYPING_REFRESH = 4      # Telegram's "typing…" expires after ~5s; refresh well inside that
+
+    # A bad token is the one thing retrying cannot fix: HTTP 401/403 (or Telegram's own
+    # Unauthorized/Forbidden) means the credential is wrong, so the poll loop stops and
+    # says so instead of hammering the API forever. Everything else is transient.
+    class AuthError < Error; end
+
+    # Poll failures that mean "the network, again": retry them forever. This is the
+    # reported bug -- an armv6 board whose TLS to api.telegram.org times out now and then
+    # used to raise and exit after six failures, so the bot went silent with only a
+    # stderr line to say why. A connection reset, a DNS blip, a 5xx or a 429 are all
+    # here; a code bug is deliberately not, so a real fault still surfaces.
+    TRANSIENT_ERRORS = [
+      Error,                    # our own api() failure: a 5xx, 429, or a non-JSON body
+      SystemCallError,          # ECONNREFUSED, ECONNRESET, EHOSTUNREACH...
+      SocketError,              # DNS
+      IOError, EOFError,
+      Timeout::Error,           # Net::OpenTimeout, Net::ReadTimeout
+      OpenSSL::SSL::SSLError    # a TLS handshake/read failure
+    ].freeze
 
     # ---- inline approvals -------------------------------------------------
     #
@@ -33,8 +54,10 @@ module RubyClaw
     # intent is refused rather than guessed.
     APPROVAL_DECISIONS = { CALLBACK_APPROVE => "granted", CALLBACK_DENY => "denied" }.freeze
 
-    # Overridable so a test can reach the give-up path without sitting through three minutes of
-    # backoff. Nothing else changes: giving up is safe because the keeper restarts the bot.
+    # How many consecutive failed polls pass before a person is told the bot cannot
+    # reach Telegram. It used to be the point at which the poller killed itself; it is
+    # now the notification threshold, so the loop is never at its mercy. Overridable so a
+    # test can reach the notice quickly without sitting through minutes of backoff.
     def max_failures = [(ENV["CLAW_TG_MAX_FAILURES"] || MAX_FAILURES).to_i, 1].max
 
     # Where the next getUpdates starts. Persisted, because the alternative is worse than
@@ -135,9 +158,25 @@ module RubyClaw
       res = Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == "https",
                             open_timeout: 15, read_timeout: timeout) { |h| h.request(req) }
       data = (JSON.parse(res.body) rescue nil)
+      # A bad token is fatal, and only that. Telegram says it with 401/403 (and echoes
+      # the words Unauthorized/Forbidden); catching it here, where the status still
+      # exists, is what lets the poll loop stop cleanly instead of retrying a credential
+      # that can never start working.
+      if auth_failure?(res.code, data)
+        raise AuthError, "telegram #{method}: HTTP #{res.code} " \
+                         "#{data&.dig('description') || res.body.to_s[0, 200]}"
+      end
       raise Error, "telegram #{method}: HTTP #{res.code} #{res.body.to_s[0, 200]}" unless data.is_a?(Hash)
       raise Error, "telegram #{method}: #{data['description']}" unless data["ok"]
       data["result"]
+    end
+
+    def auth_failure?(code, data)
+      return true if %w[401 403].include?(code.to_s)
+      return true if data.is_a?(Hash) && %w[401 403].include?(data["error_code"].to_i.to_s)
+
+      d = data.is_a?(Hash) ? data["description"].to_s : ""
+      d.match?(/unauthorized|forbidden/i)
     end
 
     def fetch_updates
@@ -158,15 +197,23 @@ module RubyClaw
       loop do
         begin
           handle(fetch_updates)
+          # A clean poll clears the streak, so the backoff never ratchets up over a long
+          # run of mostly-good polls, and the recovery notice below fires exactly once.
           failures = 0
-        rescue Error, SystemCallError, IOError, Timeout::Error => e
-          # A dropped connection used to propagate: under `claw up` the bot thread died
-          # with only a stderr line to say so, and under `claw telegram` the process
-          # aborted. Back off and keep listening; only give up if it never recovers.
+          announce_recovered
+        rescue AuthError => e
+          # The one genuinely fatal condition: a bad token cannot start working by being
+          # retried. Stop, and say exactly why in one line -- never die silently.
+          warn "rubyclaw: stopping — Telegram rejected the credentials (#{e.message}); " \
+               "fix CLAW_TELEGRAM_TOKEN and restart. A bad token cannot recover on its own."
+          break
+        rescue *TRANSIENT_ERRORS => e
+          # A dropped or timed-out poll is not the end of the bot: back off, tell the
+          # person once the streak is long enough (see announce_unreachable), and keep
+          # listening forever. The reported bug was this raising and exiting at six.
           failures += 1
-          raise if failures > max_failures
-
-          warn "rubyclaw: poll failed (#{failures}/#{max_failures}): #{e.class}: #{e.message}"
+          warn "rubyclaw: poll failed (#{failures} in a row): #{e.class}: #{e.message}"
+          announce_unreachable(failures)
           sleep [2**failures, 30].min
         end
         polls += 1
@@ -176,6 +223,46 @@ module RubyClaw
     rescue Interrupt
       warn "\nrubyclaw: stopped"
       polls
+    end
+
+    # ---- telling a person the bot is (un)reachable -------------------------
+    #
+    # Silence must not be indistinguishable from death. Once the streak crosses
+    # max_failures, the allowlisted chat hears it once and only once, and again the
+    # moment polls recover. The dedup is Notify's: the condition's key lives in the same
+    # seen-ledger every other notification uses, so there is no second suppression flag
+    # to drift out of sync. Re-arming the opposite key on each transition is what lets a
+    # *later* outage be announced again instead of being deduped into silence forever.
+    NOTICE_UNREACHABLE = "telegram:unreachable"
+    NOTICE_RECOVERED   = "telegram:recovered"
+
+    def announce_unreachable(failures)
+      return if failures < max_failures
+
+      n = notify_layer
+      n.signal(NOTICE_UNREACHABLE,
+               "⚠️ RubyClaw can't reach Telegram (#{failures} failed polls in a row). " \
+               "Still trying — nothing needs doing. You'll hear from me the moment it's back.")
+      n.rearm(NOTICE_RECOVERED)
+    rescue StandardError => e
+      warn "rubyclaw: could not raise the unreachable notice: #{e.class}: #{e.message}"
+    end
+
+    def announce_recovered
+      n = notify_layer
+      return unless n.signalled?(NOTICE_UNREACHABLE)
+
+      n.signal(NOTICE_RECOVERED, "✅ RubyClaw is back in touch with Telegram. Carry on.")
+      n.rearm(NOTICE_UNREACHABLE)
+    rescue StandardError => e
+      warn "rubyclaw: could not raise the recovery notice: #{e.class}: #{e.message}"
+    end
+
+    # Notify is loaded lazily: it requires this file, so a top-level require would be a
+    # cycle. By the time the poll loop runs, requiring it here is a no-op.
+    def notify_layer
+      require_relative "notify"
+      RubyClaw::Notify
     end
 
     def handle(updates)
@@ -220,10 +307,9 @@ module RubyClaw
       return handle_command(chat_id, text.strip) if text.start_with?("/")
 
       warn "rubyclaw: #{from}: #{text[0, 90]}"
-      send_action(chat_id, "typing")
       session = (@sessions[chat_id] ||= Harness.new(model: @model, base_url: @base_url,
                                                     api_key: @api_key, quiet: true))
-      answer = session.run(text).to_s
+      answer = with_typing(chat_id) { session.run(text).to_s }
       send_message(chat_id, answer.empty? ? "(no answer)" : answer)
       warn "rubyclaw: replied #{answer.bytesize}B | #{session.usage_line}"
     end
@@ -368,6 +454,31 @@ module RubyClaw
       api("sendChatAction", { chat_id: chat_id, action: action })
     rescue StandardError
       nil
+    end
+
+    # A long turn must not look like a dead bot. Telegram's "typing…" state is good for
+    # about five seconds, so one action at the start of a slow model turn vanishes long
+    # before the answer does. Send it immediately, then refresh it on a side thread for as
+    # long as the work runs; the thread is stopped the instant the block returns. A failed
+    # action is swallowed by send_action, so a Telegram that will not take the indicator
+    # cannot cost the answer either. No "on it!" message: the indicator is the whole
+    # signal, and the voice lives in the reply.
+    def with_typing(chat_id, interval: TYPING_REFRESH)
+      send_action(chat_id, "typing")
+      stop = Queue.new
+      pulse = Thread.new do
+        Thread.current.report_on_exception = false
+        loop do
+          break unless stop.pop(timeout: interval).nil?   # nil = timed out, keep pulsing
+
+          send_action(chat_id, "typing")
+        end
+      end
+      yield
+    ensure
+      stop&.push(:stop)
+      pulse&.join(2)
+      pulse&.kill
     end
 
     # Telegram rejects anything over 4096, counted in UTF-16 code units — so an emoji
