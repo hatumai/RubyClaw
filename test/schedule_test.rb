@@ -436,8 +436,16 @@ class ScheduleTest < Minitest::Test
       S = RubyClaw::Schedule
       S.add(name: "slow", spec: "every 1s", command: "sleep 2")
       S.run_due
+      finished = Time.now
       job = S.load.find { |j| j["name"] == "slow" }
-      puts(job["next_run"] && Time.parse(job["next_run"]) > Time.now ? "next slot is in the future" : "STILL DUE")
+      nxt = job["next_run"] && Time.parse(job["next_run"])
+      # Compare against the moment the job finished, not against the clock at the instant this
+      # line happens to run. Under a loaded suite that gap passed a second, and the slot is only
+      # one second out -- so the test was measuring its own latency, one run in fifty.
+      puts(nxt && nxt > finished ? "next slot is in the future" : "STILL DUE")
+      # What the bound is worth: the bug this guards against put the slot a second *before* the
+      # finish. Print it, so a future reader can see the assertion still discriminates.
+      puts("next=\#{nxt} finished=\#{finished} last_run=\#{job['last_run']} bug_would_be=\#{Time.parse(job['last_run']) + 1}")
     RB
     assert st.success?, out
     assert_includes out, "next slot is in the future"
