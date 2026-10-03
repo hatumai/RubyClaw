@@ -12,6 +12,7 @@
 require_relative "harness"
 require_relative "consolidate"
 require_relative "work"
+require_relative "policy"
 require "openssl"   # named on its own so a TLS failure is a class the poll loop can hold
 
 module RubyClaw
@@ -304,7 +305,7 @@ module RubyClaw
         return
       end
 
-      return handle_command(chat_id, text.strip) if text.start_with?("/")
+      return handle_command(chat_id, text.strip, from: from) if text.start_with?("/")
 
       warn "rubyclaw: #{from}: #{text[0, 90]}"
       session = (@sessions[chat_id] ||= Harness.new(model: @model, base_url: @base_url,
@@ -385,7 +386,7 @@ module RubyClaw
       warn "rubyclaw: answerCallbackQuery failed: #{e.class}: #{e.message}"
     end
 
-    def handle_command(chat_id, cmd)
+    def handle_command(chat_id, cmd, from: nil)
       case cmd.split(" ").first
       when "/new", "/start"
         @sessions.delete(chat_id)
@@ -405,6 +406,12 @@ module RubyClaw
         send_message(chat_id, "model    #{@model || RubyClaw.model_name}\n" \
                               "endpoint #{@base_url || RubyClaw.base_url}\n" \
                               "key      #{RubyClaw.api_key.to_s.empty? ? 'NOT SET' : 'set (' + RubyClaw.key_source + ')'}")
+      when "/approvals"
+        list_approvals(chat_id)
+      when "/approve", "/deny"
+        decide_approval_from_chat(chat_id, cmd, from)
+      when "/policy"
+        policy_command(chat_id, cmd)
       when "/prefer", "/remember"
         text = cmd.split(" ", 2)[1].to_s
         send_message(chat_id, text.empty? ? "usage: /prefer <how you want me to work>" :
@@ -415,12 +422,122 @@ module RubyClaw
                                      .join("\n") +
                               "\nskills: #{Notes.skill_files.size}")
       when "/help", "/?"
-        send_message(chat_id, "/new  fresh conversation\n/prefer <text>  remember a preference\n" \
-                              "/notes  what it has learned\n/tools  tool surface\n" \
-                              "/stats  tool usage\n/model  resolved model + endpoint")
+        send_message(chat_id, "/new  fresh conversation\n" \
+                              "/approvals  what is waiting on you, with Approve/Deny buttons\n" \
+                              "/approve <id>  grant one by text\n/deny <id>  refuse one by text\n" \
+                              "/policy  show the autonomy policy; /policy auto|ask|block|human_only to set the default\n" \
+                              "/prefer <text>  remember a preference\n/notes  what it has learned\n" \
+                              "/tools  tool surface\n/stats  tool usage\n/model  resolved model + endpoint")
       else
-        send_message(chat_id, "commands: /new /prefer /notes /tools /stats /model")
+        send_message(chat_id, "commands: /new /approvals /approve /deny /policy /prefer /notes /tools /stats /model")
       end
+    end
+
+    # ---- what is waiting on a person, and deciding it, from chat ----------
+    #
+    # The "I never saw it scroll past" fix: every pending approval as its own message,
+    # carrying its own Approve/Deny buttons, so deciding one never means copying an id
+    # out of a message that has already scrolled away. The text /approve and /deny below
+    # are the fallback for a client that does not render inline buttons -- not a second
+    # decision path: both call Work.decide_approval, the one path `claw work decide` uses.
+
+    def list_approvals(chat_id)
+      pending = Work.pending_approvals
+      if pending.empty?
+        send_message(chat_id, "No approvals pending.")
+        return
+      end
+      pending.each { |a| send_approval(chat_id, a["id"], approval_line(a)) }
+    end
+
+    # What an approval is for, and how long it has waited, in a person's words.
+    def approval_line(a)
+      task = Work.find_task(a["task_id"])
+      lines = ["🔔 Approval #{a['id']}",
+               "for: #{a['action']}#{task && task['title'] ? " — #{task['title']}" : ''}",
+               "task: #{a['task_id']}",
+               "waiting: #{Work.age(a['requested'])}"]
+      reason = (task && task["note"]) || a["note"]
+      lines << "reason: #{reason}" if reason.to_s.strip != ""
+      lines.join("\n")
+    end
+
+    def decide_approval_from_chat(chat_id, cmd, from)
+      parts = cmd.split(" ", 2)
+      intent = parts[0].to_s.sub(%r{\A/}, "")
+      id = parts[1].to_s.strip
+      if id.empty?
+        send_message(chat_id, "usage: /#{intent} <approval_id> — list the ids with /approvals")
+        return
+      end
+
+      decision = intent == "approve" ? "granted" : "denied"
+      begin
+        Work.decide_approval(id, decision, by: "telegram:#{from}")
+        send_message(chat_id, decision == "granted" ? "✅ Approved #{id}." : "🚫 Denied #{id}.")
+      rescue Error => e
+        # A missing id, an unknown id and an already-decided approval each land here as
+        # one clear line. Work does the read and the write under its store lock, so
+        # nothing is half-applied when it refuses.
+        send_message(chat_id, e.message)
+      end
+    end
+
+    # ---- the policy, readable and changeable from chat --------------------
+    #
+    # The write goes to the instance layer (ROOT/instance/policy.yml), never to the
+    # git-tracked policy.yml the project ships: a change made here must survive a
+    # `git pull` instead of fighting it. Policy.set_default! writes the file and calls
+    # Policy.reset!, so the new default is live on the very next check, no restart.
+
+    def policy_command(chat_id, cmd)
+      arg = cmd.split(" ", 2)[1].to_s.strip.downcase
+      if arg.empty?
+        send_message(chat_id, render_policy)
+        return
+      end
+
+      begin
+        file = Policy.set_default!(arg)
+        send_message(chat_id, "✅ Policy default set to #{arg} in #{relative_path(file)}.\n\n#{render_policy}")
+      rescue Error => e
+        send_message(chat_id, e.message)
+      end
+    end
+
+    # The effective policy as a person reads it: the default, which file it came from,
+    # and the rules in force -- so the layering is visible rather than guessed at.
+    def render_policy
+      cfg = Policy.config
+      source = cfg["path"].to_s
+      layer = if source == Policy::INSTANCE_FILE
+                "instance layer (yours, survives git pull)"
+              elsif source == Policy::DEFAULT_FILE
+                "project policy.yml"
+              else
+                "CLAW_POLICY"
+              end
+      lines = ["Autonomy policy",
+               "default: #{cfg['default']}  (an action with no matching rule is #{cfg['default']})",
+               "source:  #{relative_path(source)}  [#{layer}]"]
+      rules = Array(cfg["rules"])
+      if rules.empty?
+        lines << "rules:   none"
+      else
+        lines << "rules:"
+        rules.each do |r|
+          note = r["note"].to_s.strip
+          lines << "  #{Array(r['match']).join(', ')} -> #{r['policy']}#{note.empty? ? '' : "  (#{note})"}"
+        end
+      end
+      lines.join("\n")
+    end
+
+    # ROOT-relative where it is under the root, absolute otherwise: a person sees
+    # `instance/policy.yml`, not a tmpdir path.
+    def relative_path(path)
+      prefix = "#{ROOT}/"
+      path.to_s.start_with?(prefix) ? path.to_s[prefix.length..] : path.to_s
     end
 
     def send_message(chat_id, text, reply_markup: nil)

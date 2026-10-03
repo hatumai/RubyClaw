@@ -15,7 +15,7 @@ module ClawTest
     def initialize(updates: [], user: { "id" => 1, "is_bot" => true, "first_name" => "stub",
                                         "username" => "stub_bot" },
                    hold: false, errors: {}, statuses: {}, delay: 0, fail_sends: 0,
-                   fail_polls: 0)
+                   fail_polls: 0, fail_polls_at: [])
       @queue = updates.dup
       @user = user
       @hold = hold                 # true: getUpdates always returns the same update
@@ -31,6 +31,10 @@ module ClawTest
       # a wedged link does, and the rest succeed. A test can then prove the poller rides
       # out a transient outage (and that the notice fires once, not once per failure).
       @fail_polls = fail_polls
+      # ...or fail at chosen poll numbers (1-based), so a test can drive a SECOND outage
+      # after a recovery and prove the notice re-fires for it: fail_polls_at: [1, 2, 4].
+      @fail_polls_at = Array(fail_polls_at)
+      @poll_seq = 0
       @sent = []
       @calls = []
       @edits = []                  # editMessageText / editMessageReplyMarkup payloads
@@ -123,6 +127,12 @@ module ClawTest
       case method
       when "getMe" then [200, { "ok" => true, "result" => @user }]
       when "getUpdates"
+        # A chosen poll number that must fail -- lets a test script a second outage.
+        seq = @mutex.synchronize { @poll_seq += 1 }
+        if @fail_polls_at.include?(seq)
+          return [503, { "ok" => false, "error_code" => 503,
+                         "description" => "simulated transient outage" }]
+        end
         # A transient outage: answer 503 until the budget runs out, then behave.
         failed = @mutex.synchronize { @fail_polls.positive? && (@fail_polls -= 1) }
         if failed

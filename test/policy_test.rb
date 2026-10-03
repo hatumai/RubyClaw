@@ -298,6 +298,68 @@ class PolicyTest < Minitest::Test
     end
   end
 
+  # ---- the instance layer, the way instance/SOUL.md is layered --------------------
+
+  # ROOT/instance/policy.yml wins when it exists, then CLAW_POLICY, then the shipped
+  # policy.yml. Layered by replacement, so the file that wins is the whole policy.
+  def test_the_instance_policy_layer_wins_when_present
+    out, st = sandbox.ruby(<<~'RB', env: SANDBOX_POLICY)
+      require "boot"; require "policy"
+      P = RubyClaw::Policy
+      rel = ->(p) { p.sub(Dir.pwd + "/", "") }
+      puts "before=#{rel.call(P.path)} default=#{P.decide('anything')['policy']}"
+      FileUtils.mkdir_p("instance")
+      File.write("instance/policy.yml", "default: block\nrules: []\n")
+      P.reset!
+      puts "after=#{rel.call(P.path)} default=#{P.decide('anything')['policy']}"
+    RB
+    assert st.success?, out
+    assert_match(/before=policy\.yml default=ask/, out, "with no instance file the shipped one wins")
+    assert_match(%r{after=instance/policy\.yml default=block}, out, "the instance layer wins once present")
+  end
+
+  def test_the_instance_policy_layer_beats_claw_policy_too
+    sandbox.write("other.yml", "default: auto\nrules: []\n")
+    sandbox.write("instance/policy.yml", "default: block\nrules: []\n")
+    out, st = sandbox.ruby(<<~'RB', env: { "CLAW_POLICY" => "other.yml" })
+      require "boot"; require "policy"
+      puts RubyClaw::Policy.path.sub(Dir.pwd + "/", "")
+      puts RubyClaw::Policy.decide("anything")["policy"]
+    RB
+    assert st.success?, out
+    assert_match(%r{instance/policy\.yml}, out, "instance wins over CLAW_POLICY")
+    assert_match(/^block$/, out)
+  end
+
+  # set_default! is what the /policy chat command calls: it writes the instance layer
+  # with the default changed, KEEPS the rules in force, and never touches the shipped,
+  # git-tracked policy.yml.
+  def test_set_default_writes_the_instance_layer_and_keeps_the_rules
+    shipped_before = sandbox.read("policy.yml")
+    out, st = sandbox.ruby(<<~'RB', env: SANDBOX_POLICY)
+      require "boot"; require "policy"
+      P = RubyClaw::Policy
+      path = P.set_default!("auto")
+      puts "path=#{path.sub(Dir.pwd + "/", "")}"
+      puts "default=#{P.decide('anything')['policy']} shell=#{P.decide('shell.run')['policy']} " \
+           "fw=#{P.decide('work.decide')['policy']}"
+    RB
+    assert st.success?, out
+    assert_match(%r{path=instance/policy\.yml}, out)
+    assert_match(/default=auto shell=ask fw=human_only/, out,
+                 "the default changed; the rules still apply")
+    assert_equal shipped_before, sandbox.read("policy.yml"), "the tracked policy.yml is untouched"
+    assert_match(/^default: auto$/, sandbox.read("instance", "policy.yml"))
+    assert_match(/files\.read/, sandbox.read("instance", "policy.yml"), "the rules were carried over")
+  end
+
+  def test_set_default_refuses_an_unknown_name_and_lists_the_four
+    err = assert_raises(RubyClaw::Error) { P.set_default!("whenever") }
+    assert_match(/unknown policy "whenever"/, err.message)
+    assert_match(/auto \| ask \| block \| human_only/, err.message)
+    refute P.from_instance?, "a refused name wrote no instance file"
+  end
+
   # ---- through the dispatch path, in a sandbox -----------------------------------
   # Everything above decides; everything below is the decision reaching lib/registry.rb
   # `call` before a tool runs, against the real store.
