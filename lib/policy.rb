@@ -34,6 +34,12 @@ require_relative "work"
 module RubyClaw
   module Policy
     DEFAULT_FILE = File.join(ROOT, "policy.yml")
+    # The instance layer, layered exactly the way instance/SOUL.md beats SOUL.md: a copy
+    # at ROOT/instance/policy.yml wins over both the shipped file and CLAW_POLICY. It
+    # exists because policy.yml ships with the project and is tracked by git: a change
+    # written there would collide with the next `git pull`. A chat command writes HERE
+    # instead, so the operator's own policy is theirs and upstream's file stays upstream's.
+    INSTANCE_FILE = File.join(ROOT, "instance", "policy.yml")
     POLICIES = %w[auto ask block human_only].freeze
     DEFAULT_POLICY = "ask"
 
@@ -110,12 +116,38 @@ module RubyClaw
 
       # ---- reading the policy file ------------------------------------------
 
-      # CLAW_POLICY points the layer at another file (an operator's own policy, or a
-      # test's). It only changes which file is read; it cannot make the default
-      # anything but ask.
+      # ROOT/instance/policy.yml wins when present, then CLAW_POLICY if set, then the
+      # shipped ROOT/policy.yml. The layering is by replacement, not merge -- the file
+      # that wins is the whole policy, the same way instance/SOUL.md replaces the soul.
       def path
+        return INSTANCE_FILE if File.exist?(INSTANCE_FILE)
+
         p = ENV["CLAW_POLICY"].to_s
         p.empty? ? DEFAULT_FILE : File.expand_path(p)
+      end
+
+      def instance_path = INSTANCE_FILE
+      def from_instance? = path == INSTANCE_FILE
+
+      # Write the instance layer with `name` as the default, keeping the rules already
+      # in force so setting a default cannot silently drop them. The shipped file is
+      # never touched. reset! so the change is live on the next check, no restart.
+      # An unknown name is refused with the four valid ones listed.
+      def set_default!(name)
+        name = name.to_s.strip.downcase
+        unless POLICIES.include?(name)
+          raise Error, "unknown policy #{name.inspect}; use #{POLICIES.join(' | ')}"
+        end
+
+        rules = (config["rules"] || []).map do |r|
+          rule = { "match" => r["match"], "policy" => r["policy"] }
+          rule["note"] = r["note"] if r["note"]
+          rule
+        end
+        FileUtils.mkdir_p(File.dirname(INSTANCE_FILE))
+        File.write(INSTANCE_FILE, YAML.dump("default" => name, "rules" => rules))
+        reset!
+        INSTANCE_FILE
       end
 
       def config

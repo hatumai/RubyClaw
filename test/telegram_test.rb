@@ -386,6 +386,265 @@ class TelegramTest < Minitest::Test
     sb&.cleanup
   end
 
+  # The gap the first two tests left: re-notification after a SECOND outage. The loop
+  # re-arms the opposite key on each transition, so a later outage is heard again instead
+  # of being deduped into silence forever. The script is fail, fail, ok, fail, ok: two
+  # failed polls for the first outage, a recovery, then a second outage, then a recovery.
+  # Each notice must fire exactly once per transition -- one unreachable and one recovery
+  # per outage-and-recovery pair -- even though the first outage spans two failed polls.
+  def test_a_second_outage_is_announced_again_once_per_transition
+    @tg.stop
+    @tg = FakeTG.new(fail_polls_at: [1, 2, 4])
+    sb = Sandbox.new("tgream")
+    out, st = drive_poller(sb, max_polls: 5, max_failures: 1)
+    assert st.success?, out
+    assert_match(/POLLS=5/, out, "the loop rode out both outages and ran every poll:\n#{out}")
+    unreachable = @tg.texts.count { |t| t.include?("can't reach Telegram") }
+    recovered = @tg.texts.count { |t| t.include?("back in touch") }
+    assert_equal 2, unreachable,
+                 "one notice per outage, and the second outage was announced again:\n#{@tg.texts.inspect}\n#{out}"
+    assert_equal 2, recovered,
+                 "one recovery notice per recovery, and the second recovery was announced:\n#{@tg.texts.inspect}\n#{out}"
+  ensure
+    sb&.cleanup
+  end
+
+  # ---- /approvals, /approve, /deny: deciding from chat ---------------------
+  #
+  # The text surface for the approval store. /approvals is the "I never saw it scroll
+  # past" fix: one message per pending approval, each carrying its own buttons. /approve
+  # and /deny are the fallback for a client that does not render buttons, resolving
+  # through Work.decide_approval -- the one path the buttons and `claw work decide` use.
+
+  # Queue a command and drive the real bot once; the command answers from @tg.
+  def run_command(sb, text, chat: 42, env: {})
+    queue(text, chat: chat)
+    sb.claw("telegram", "--once", env: callback_env.merge(env), timeout: 30)
+  end
+
+  def test_approvals_lists_each_pending_one_with_its_own_buttons
+    sb = Sandbox.new("tglistapps")
+    id1 = park_approval(sb)
+    id2 = park_approval(sb)
+    out, st = run_command(sb, "/approvals")
+    assert st.success?, out
+
+    bodies = @tg.texts.select { |t| t.include?("🔔 Approval") }
+    assert_equal 2, bodies.size, "one message per pending approval:\n#{@tg.texts.inspect}"
+    [id1, id2].each do |id|
+      body = bodies.find { |t| t.include?(id) }
+      refute_nil body, "approval #{id} must be listed"
+      assert_match(/for: files\.write/, body, "what it is for")
+      assert_match(/waiting: /, body, "how long it has waited")
+    end
+
+    callbacks = @tg.sent.flat_map do |m|
+      kb = m[:reply_markup]
+      kb ? kb["inline_keyboard"].flatten.map { |b| b["callback_data"] } : []
+    end
+    [id1, id2].each do |id|
+      assert_includes callbacks, "approve:#{id}", "each entry carries its own Approve button"
+      assert_includes callbacks, "deny:#{id}", "each entry carries its own Deny button"
+    end
+  ensure
+    sb&.cleanup
+  end
+
+  def test_approvals_with_nothing_pending_says_so_in_one_line
+    sb = Sandbox.new("tgnoapps")
+    out, st = run_command(sb, "/approvals")
+    assert st.success?, out
+    assert_equal 1, @tg.sent.size, "one line, not a message per imagined approval:\n#{@tg.texts.inspect}"
+    assert_match(/No approvals pending/, @tg.texts.first)
+    assert_nil @tg.sent.first[:reply_markup]
+  ensure
+    sb&.cleanup
+  end
+
+  def test_approve_by_text_grants_through_the_same_path_as_the_buttons
+    sb = Sandbox.new("tgapprovetext")
+    id = park_approval(sb)
+    out, st = run_command(sb, "/approve #{id}")
+    assert st.success?, out
+    a = approval_in(sb, id)
+    assert_equal "granted", a["status"]
+    assert_equal "telegram:the operator", a["decided_by"],
+                 "attributed to the sender, through Work.decide_approval"
+    assert_match(/✅ Approved #{id}/, @tg.texts.last)
+    task = JSON.parse(sb.read("data", "work.json"))["tasks"].find { |t| t["id"] == a["task_id"] }
+    assert_equal "WORKING", task["state"], "a grant hands the task back, the same as the CLI"
+  ensure
+    sb&.cleanup
+  end
+
+  def test_deny_by_text_denies_and_parks_the_task
+    sb = Sandbox.new("tgdenytext")
+    id = park_approval(sb)
+    out, st = run_command(sb, "/deny #{id}")
+    assert st.success?, out
+    a = approval_in(sb, id)
+    assert_equal "denied", a["status"]
+    assert_equal "telegram:the operator", a["decided_by"]
+    assert_match(/🚫 Denied #{id}/, @tg.texts.last)
+    task = JSON.parse(sb.read("data", "work.json"))["tasks"].find { |t| t["id"] == a["task_id"] }
+    assert_equal "BLOCKED", task["state"]
+  ensure
+    sb&.cleanup
+  end
+
+  def test_approve_without_an_id_says_how_to_find_one
+    sb = Sandbox.new("tgappnoid")
+    out, st = run_command(sb, "/approve")
+    assert st.success?, out
+    assert_match(%r{usage: /approve <approval_id>}, @tg.texts.last)
+    assert_match(%r{/approvals}, @tg.texts.last)
+  ensure
+    sb&.cleanup
+  end
+
+  def test_approving_an_unknown_id_is_one_line_not_a_crash
+    sb = Sandbox.new("tgappunknown")
+    out, st = run_command(sb, "/approve ap-doesnotexist")
+    assert st.success?, out
+    assert_match(/no approval ap-doesnotexist/, @tg.texts.last)
+    refute_match(/update failed: .*no approval/, out, "an unknown id is answered, not a crash")
+  ensure
+    sb&.cleanup
+  end
+
+  def test_approving_an_already_decided_one_does_not_flip_it
+    sb = Sandbox.new("tgappdecided")
+    id = park_approval(sb)
+    d, dst = sb.ruby(<<~RB)
+      require "boot"; require "work"
+      RubyClaw::Work.decide_approval("#{id}", "granted", by: "cli")
+    RB
+    assert dst.success?, d
+    out, st = run_command(sb, "/approve #{id}")
+    assert st.success?, out
+    assert_match(/already granted/, @tg.texts.last)
+    assert_equal "granted", approval_in(sb, id)["status"], "the first decision stands"
+    assert_equal "cli", approval_in(sb, id)["decided_by"]
+  ensure
+    sb&.cleanup
+  end
+
+  # ---- /policy: reading and setting the autonomy policy from chat ----------
+
+  def test_policy_shows_the_effective_default_source_and_rules
+    sb = Sandbox.new("tgpolicyshow")
+    out, st = run_command(sb, "/policy", env: { "CLAW_POLICY" => nil })
+    assert st.success?, out
+    text = @tg.texts.last
+    assert_match(/default: ask/, text)
+    assert_match(%r{source:  policy\.yml}, text)
+    assert_match(/project policy\.yml/, text, "it names the file the policy came from")
+    assert_match(/files\.read -> auto/, text, "the rules in force are listed")
+    assert_match(/work\.decide -> human_only/, text)
+    refute sb.exist?("instance", "policy.yml"), "reading the policy writes nothing"
+  ensure
+    sb&.cleanup
+  end
+
+  def test_policy_sets_the_default_in_the_instance_layer_and_leaves_the_tracked_file_alone
+    sb = Sandbox.new("tgpolicyset")
+    tracked_before = sb.read("policy.yml")
+    out, st = run_command(sb, "/policy auto", env: { "CLAW_POLICY" => nil })
+    assert st.success?, out
+    assert sb.exist?("instance", "policy.yml"), "the instance layer is created"
+    assert_equal tracked_before, sb.read("policy.yml"),
+                 "the git-tracked policy.yml must never be written by a chat command"
+    inst = sb.read("instance", "policy.yml")
+    assert_match(/^default: auto$/, inst)
+    assert_match(/files\.read/, inst, "the rules in force are carried over, not dropped")
+    assert_match(/work\.decide/, inst)
+    assert_match(%r{Policy default set to auto in instance/policy\.yml}, @tg.texts.last)
+    assert_match(%r{source:  instance/policy\.yml}, @tg.texts.last)
+    assert_match(/instance layer/, @tg.texts.last, "the reply shows which layer now wins")
+
+    # A fresh process reads the instance layer, and the shipped rules still apply.
+    eff, st2 = sb.ruby(<<~'RB', env: { "CLAW_POLICY" => nil })
+      require "boot"; require "policy"
+      P = RubyClaw::Policy
+      puts "path=#{P.path.sub(Dir.pwd + '/', '')} default=#{P.decide('anything')['policy']} " \
+           "shell=#{P.decide('shell.run')['policy']}"
+    RB
+    assert st2.success?, eff
+    assert_match(%r{path=instance/policy\.yml default=auto shell=ask}, eff,
+                 "the instance default is in force while the shipped rules still apply")
+  ensure
+    sb&.cleanup
+  end
+
+  def test_policy_refuses_an_unknown_name_and_lists_the_four
+    sb = Sandbox.new("tgbadpolicy")
+    tracked_before = sb.read("policy.yml")
+    out, st = run_command(sb, "/policy whenever", env: { "CLAW_POLICY" => nil })
+    assert st.success?, out
+    assert_match(/unknown policy "whenever"/, @tg.texts.last)
+    assert_match(/auto \| ask \| block \| human_only/, @tg.texts.last)
+    refute sb.exist?("instance", "policy.yml"), "a refused name writes nothing"
+    assert_equal tracked_before, sb.read("policy.yml"), "and the tracked file is untouched"
+  ensure
+    sb&.cleanup
+  end
+
+  # reset! is what makes the change live in the SAME process, with no restart. Driving
+  # handle_command and then re-checking the policy in one child proves it: without
+  # reset! the memoised config from before the write would still answer.
+  def test_setting_the_policy_takes_effect_without_a_restart
+    sb = Sandbox.new("tgpolicyreset")
+    code = <<~'RB'
+      require "boot"; require "telegram"; require "policy"
+      a = RubyClaw::Telegram.new(allowed: ["42"])
+      puts "before=#{RubyClaw::Policy.decide('anything')['policy']}"
+      a.handle_command(42, "/policy block")
+      puts "after=#{RubyClaw::Policy.decide('anything')['policy']}"
+      puts "path=#{RubyClaw::Policy.path.sub(Dir.pwd + '/', '')}"
+    RB
+    env = { "CLAW_TELEGRAM_API_BASE" => @tg.base, "CLAW_TELEGRAM_TOKEN" => "stub",
+            "CLAW_TELEGRAM_ALLOWED" => "42", "CLAW_POLICY" => nil }
+    out, st = sb.ruby(code, env: env)
+    assert st.success?, out
+    assert_match(/before=ask/, out, "the shipped default before the command")
+    assert_match(/after=block/, out, "the instance default, live in the same process -- no restart")
+    assert_match(%r{path=instance/policy\.yml}, out)
+  ensure
+    sb&.cleanup
+  end
+
+  # ---- the allowlist gates every command (the security half) ---------------
+
+  # A chat that is not allowlisted must be refused before any of these runs, and must
+  # change nothing: no decision, no store write, no policy file. This is the same rule
+  # handle_message enforces for a plain message and handle_callback for a button.
+  def test_a_command_from_a_chat_not_on_the_allowlist_changes_nothing
+    sb = Sandbox.new("tgcmddeny")
+    id = park_approval(sb)
+
+    out, st = run_command(sb, "/approve #{id}", chat: 999)
+    assert st.success?, out
+    assert_match(/Not configured to talk to chat 999/, @tg.texts.last)
+    assert_equal "pending", approval_in(sb, id)["status"],
+                 "a chat off the allowlist must not be able to decide an approval"
+
+    out2, st2 = run_command(sb, "/deny #{id}", chat: 999)
+    assert st2.success?, out2
+    assert_equal "pending", approval_in(sb, id)["status"], "and cannot deny it either"
+
+    out3, st3 = run_command(sb, "/policy auto", chat: 999)
+    assert st3.success?, out3
+    refute sb.exist?("instance", "policy.yml"), "an unlisted chat must not write the policy layer"
+    refute_match(/Policy default set/, @tg.texts.last)
+
+    out4, st4 = run_command(sb, "/approvals", chat: 999)
+    assert st4.success?, out4
+    assert_match(/Not configured to talk to chat 999/, @tg.texts.last)
+    refute_match(/Approval ap-/, @tg.texts.last, "an unlisted chat is not even shown what is pending")
+  ensure
+    sb&.cleanup
+  end
+
   # ---- never look dead while it works --------------------------------------
 
   # A long model turn used to send nothing until the answer, which reads as a bot that

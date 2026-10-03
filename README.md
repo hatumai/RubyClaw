@@ -41,6 +41,13 @@ outright, and `block` does the same while recording why. The file is read on eve
 check, so an edit takes effect without a restart. `CLAW_POLICY=/path/to/other.yml`
 points at a different file.
 
+From Telegram the policy is readable and changeable without a shell: `/policy` shows the
+default, the file it came from and the rules in force, and `/policy auto|ask|block|human_only`
+sets the default. The write goes to **`instance/policy.yml`**, layered the way
+`instance/SOUL.md` is — it wins when present, then `CLAW_POLICY`, then the shipped
+`policy.yml`. So a command from chat never rewrites the git-tracked file a `git pull`
+brings down, and the reply names which file won.
+
 ## What it does
 
 - **Writes its own tools, verified before trust.** Ask for something it cannot do and it writes a
@@ -163,7 +170,11 @@ with the exact `./rubyclaw work decide <id> granted` command as a fallback; tapp
 the approval through the same store path `claw work decide` uses, answers the tap, and edits the
 message to show the outcome with the buttons spent — a task that reached `DONE`, `FAILED` or
 `BLOCKED`, and a scheduled job the policy held
-— never raw logs. A responsibility's `reporting` policy decides the rest (`on_change`/`always`,
+— never raw logs. The same surface is operable by text, for a client that does not render buttons:
+`/approvals` lists every pending approval, each as its own message carrying its own buttons, and
+`/approve <id>` / `/deny <id>` decide one by text through that same store path. Every command is
+gated by the allowlist first, so an unlisted chat can neither see nor decide anything.
+A responsibility's `reporting` policy decides the rest (`on_change`/`always`,
 `on_completion` the default, `on_failure`, `daily_digest`, `silent`/`never`). Only a chat in
 `telegram_allowed_chat_ids` (or `CLAW_TELEGRAM_ALLOWED`) is ever a destination; with no allowlist
 nothing is sent, and the notification is recorded as undeliverable rather than aimed at a guessed
