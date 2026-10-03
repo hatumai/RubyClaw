@@ -445,7 +445,7 @@ class ScheduleTest < Minitest::Test
       puts(nxt && nxt > finished ? "next slot is in the future" : "STILL DUE")
       # What the bound is worth: the bug this guards against put the slot a second *before* the
       # finish. Print it, so a future reader can see the assertion still discriminates.
-      puts("next=\#{nxt} finished=\#{finished} last_run=\#{job['last_run']} bug_would_be=\#{Time.parse(job['last_run']) + 1}")
+      puts("next=#{nxt} finished=#{finished} last_run=#{job['last_run']} bug_would_be=#{Time.parse(job['last_run']) + 1}")
     RB
     assert st.success?, out
     assert_includes out, "next slot is in the future"
