@@ -461,7 +461,12 @@ module RubyClaw
       # where it belongs instead of pretending work is still happening. What a decision then
       # *means* for the rest of the harness is stage B's policy; here it is one record and
       # one state, which is all stage A owns.
-      def request_approval(task_id:, action:, note: nil, now: Time.now)
+      #
+      # `dream_path` is provenance for a proposal the dream pass (lib/dream.rb) parked: the
+      # dream artifact the proposed write came from, recorded so an approval can always be
+      # traced to the pass that produced it. It is only written when given, so an ordinary
+      # approval record is unchanged.
+      def request_approval(task_id:, action:, note: nil, dream_path: nil, now: Time.now)
         action = action.to_s.strip
         raise Error, "an approval needs an action (what the human is approving)" if action.empty?
 
@@ -478,6 +483,7 @@ module RubyClaw
           "decided_by" => nil,
           "note" => blank_to_nil(note)
         }
+        approval["dream_path"] = blank_to_nil(dream_path) if dream_path
         with_lock do
           list = tasks
           task = list.find { |t| t["id"] == task_id } or raise Error, "no task #{task_id}"

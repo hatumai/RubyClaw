@@ -506,31 +506,10 @@ module RubyClaw
     end
 
     # The effective policy as a person reads it: the default, which file it came from,
-    # and the rules in force -- so the layering is visible rather than guessed at.
+    # and the rules in force -- so the layering is visible rather than guessed at. The
+    # rendering lives in Policy so `claw policy` and `/policy` cannot drift apart.
     def render_policy
-      cfg = Policy.config
-      source = cfg["path"].to_s
-      layer = if source == Policy::INSTANCE_FILE
-                "instance layer (yours, survives git pull)"
-              elsif source == Policy::DEFAULT_FILE
-                "project policy.yml"
-              else
-                "CLAW_POLICY"
-              end
-      lines = ["Autonomy policy",
-               "default: #{cfg['default']}  (an action with no matching rule is #{cfg['default']})",
-               "source:  #{relative_path(source)}  [#{layer}]"]
-      rules = Array(cfg["rules"])
-      if rules.empty?
-        lines << "rules:   none"
-      else
-        lines << "rules:"
-        rules.each do |r|
-          note = r["note"].to_s.strip
-          lines << "  #{Array(r['match']).join(', ')} -> #{r['policy']}#{note.empty? ? '' : "  (#{note})"}"
-        end
-      end
-      lines.join("\n")
+      Policy.render
     end
 
     # ROOT-relative where it is under the root, absolute otherwise: a person sees

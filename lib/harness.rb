@@ -9,12 +9,17 @@ require "securerandom"
 require "fileutils"
 
 module RubyClaw
-  # One-shot completion: no tools, no loop, no message history. Used by the
-  # consolidation pass, where a single JSON answer is all that is wanted.
-  def self.chat_once(messages, model: nil, json_object: false, max_tokens: 4000)
+  # One-shot completion: no loop, no message history. Used by the consolidation pass,
+  # where a single JSON answer is all that is wanted. `tools:` is supplied only by the
+  # dream pass (lib/dream.rb), whose sandbox hands the model one scoped read and
+  # dispatches every tool call itself -- so the dream never reaches the registry the
+  # network and shell tools live in. `tool_calls` comes back for the same reason: a
+  # caller that offers tools must be able to see what the model asked for.
+  def self.chat_once(messages, model: nil, json_object: false, max_tokens: 4000, tools: nil)
     uri = URI("#{base_url}/chat/completions")
     body = { model: model || model_name, messages: messages, max_tokens: max_tokens }
     body[:response_format] = { type: "json_object" } if json_object
+    body[:tools] = tools if tools && !tools.empty?
     req = Net::HTTP::Post.new(uri)
     req["Content-Type"] = "application/json"
     req["Authorization"] = "Bearer #{api_key}" if api_key
@@ -24,7 +29,7 @@ module RubyClaw
     raise Error, "provider returned #{res.code}: #{res.body.to_s[0, 400]}" unless res.code.to_i == 200
     data = JSON.parse(res.body)
     msg = data.dig("choices", 0, "message") or raise Error, "no message in response"
-    { "content" => msg["content"].to_s, "usage" => data["usage"] || {} }
+    { "content" => msg["content"].to_s, "tool_calls" => msg["tool_calls"], "usage" => data["usage"] || {} }
   end
 
   class Harness

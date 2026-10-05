@@ -106,6 +106,7 @@ end
 require_relative "../lib/harness"
 require_relative "../lib/selftest"
 require_relative "../lib/consolidate"
+require_relative "../lib/dream"
 require_relative "../lib/telegram"
 require_relative "../lib/chat"
 require_relative "../lib/setup"
@@ -213,6 +214,15 @@ when "consolidate"
   i = ARGV.index("--model")
   ok = RubyClaw::Consolidate.run(apply: apply, quiet: quiet, model: i ? ARGV[i + 1] : nil)
   exit(ok ? 0 : 1)
+when "dream"
+  # The offline consolidation pass: check the trigger, read the inputs, write one dated
+  # artifact under memory/dreams/, and park every proposed memory write for a person.
+  # --auto-apply is the explicit, off-by-default switch; nothing is applied without it.
+  model = take_flag("--model")
+  auto = has_flag("--auto-apply") ? true : nil
+  RubyClaw::Dream.run(model: model, auto_apply: auto)
+when "policy"
+  puts RubyClaw::Policy.render
 when "update"
   check = !ARGV.delete("--check").nil?
   r = RubyClaw::Update.run(check: check)
@@ -558,6 +568,13 @@ else
       stats          per-tool usage: calls, errors, age, idle time
       consolidate    audit tools/ for duplicates to merge or retire
                      (--apply executes the plan; default is a dry run)
+      dream          the offline consolidation pass: check the trigger, read the notes,
+                     transcripts and work store, write one dated artifact under
+                     memory/dreams/, and park every proposed memory write as an approval.
+                     Nothing is applied. --auto-apply is the explicit, off-by-default switch
+      policy         the autonomy policy in force: the default, the file it came from,
+                     and the rules -- including the dream.run boundary (it reads
+                     everything and sends nothing)
       evo            what the harness has grown (log/evolution.jsonl)
       update         self-update from the home repo: take what upstream changed unless this
                      instance has changed that path itself, which is kept and reported

@@ -69,7 +69,13 @@ module RubyClaw
       # here lets policy.yml say, explicitly, that this channel is `auto`. An approval
       # system whose own notification channel could be parked would deadlock: the message
       # carrying the Approve button would itself be waiting for a person.
-      "telegram" => "telegram.send"
+      "telegram" => "telegram.send",
+      # The dream pass (lib/dream.rb), like `telegram`, is not a tool the model calls --
+      # it is the harness's own offline consolidation run. Naming it here is what lets
+      # policy.yml state the boundary in one place: the one pass that reads everything and
+      # sends nothing is `dream.run`, so `claw policy` shows it the way http.get/http.send
+      # are split.
+      "dream" => "dream.run"
     }.freeze
 
     # The refinement tables. They read ONE coarse argument and never its content: an
@@ -316,6 +322,43 @@ module RubyClaw
           "BLOCKED BY POLICY: `#{action}` (#{why_text(d)}) is `block`. It did NOT run, and no approval " \
             "can grant it."
         end
+      end
+
+      # ---- the view (`claw policy`, `/policy`) ------------------------------
+      # One renderer, so the terminal and the chat cannot drift apart: the effective
+      # default, which file it came from, and the rules in force in order. This is where
+      # the dream's boundary is legible next to http.get/http.send.
+      def render
+        cfg = config
+        source = cfg["path"].to_s
+        layer = if source == INSTANCE_FILE
+                  "instance layer (yours, survives git pull)"
+                elsif source == DEFAULT_FILE
+                  "project policy.yml"
+                else
+                  "CLAW_POLICY"
+                end
+        lines = ["Autonomy policy",
+                 "default: #{cfg['default']}  (an action with no matching rule is #{cfg['default']})",
+                 "source:  #{rel_path(source)}  [#{layer}]"]
+        rules = Array(cfg["rules"])
+        if rules.empty?
+          lines << "rules:   none"
+        else
+          lines << "rules:"
+          rules.each do |r|
+            note = r["note"].to_s.strip
+            lines << "  #{Array(r['match']).join(', ')} -> #{r['policy']}#{note.empty? ? '' : "  (#{note})"}"
+          end
+        end
+        lines.join("\n")
+      end
+
+      # ROOT-relative where it is under the root, absolute otherwise: a person sees
+      # `policy.yml`, not a tmpdir path.
+      def rel_path(path)
+        prefix = "#{ROOT}/"
+        path.to_s.start_with?(prefix) ? path.to_s[prefix.length..] : path.to_s
       end
     end
   end
