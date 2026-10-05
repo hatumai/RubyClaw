@@ -29,6 +29,7 @@
 #   responsibility.manage  selfwrite.tool  selfwrite.skill  selfwrite.core
 #   scout.search  scout.read   (reads only; there is no writable scout.* action)
 #   telegram.send  (the harness's own outbound bot; `auto`, see the rule below)
+#   dream.run   (the offline consolidation pass; it reads everything and sends nothing)
 #   tool.<name>  for any self-written or unlisted tool (unmatched -> ask)
 #
 # Every decision is appended to data/events.jsonl (kind policy.auto / policy.ask /
@@ -67,6 +68,20 @@ rules:
   - match: work.manage
     policy: auto
     note: its own task/artifact/event store
+
+  # --- the dream: the one pass that reads everything, and cannot send anything ------
+  # `claw dream` is the offline consolidation pass: it reads the notes store, the session
+  # transcripts and the work store, and writes exactly one artifact of its own --
+  # memory/dreams/YYYY-MM-DD.md. Its model turn is offered one tool, a scoped read of
+  # those same inputs; there is deliberately no http, no shell and no browser in its
+  # surface, because the pass that can read everything must not be able to send anything.
+  # That is the whole reason this action name exists: `dream.run` is the boundary, stated
+  # here the way http.get and http.send are split. It applies nothing -- each proposed
+  # memory write parks a work approval for a person, carrying the dream artifact's path.
+  # `auto_apply` exists as an explicit switch and is OFF unless set.
+  - match: dream.run
+    policy: auto
+    note: it reads its inputs and writes only its own artifact; every proposed memory write parks for a person
 
   # --- the approval channel itself must stay open -------------------------------
   # The Telegram bot is how an approval reaches a person, so its own sends must never be
